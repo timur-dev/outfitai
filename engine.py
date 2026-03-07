@@ -1,6 +1,7 @@
 """
 OutfitAI Engine
 Handles outfit scoring, color theory, and Claude API calls.
+Keys are read from Streamlit secrets first, then fall back to manual input.
 """
 import random
 from collections import Counter
@@ -10,6 +11,14 @@ try:
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
+
+def get_secret(key: str, fallback: str = "") -> str:
+    """Read from Streamlit Cloud secrets, fall back to provided value."""
+    try:
+        import streamlit as st
+        return st.secrets.get(key, fallback)
+    except Exception:
+        return fallback
 
 
 # ── Color Theory Data ─────────────────────────────────────────────────────────
@@ -74,7 +83,8 @@ class OutfitEngine:
         self.wardrobe = wardrobe
         self.occasion = occasion
         self.city = city
-        self.api_key = api_key
+        # Auto-load from Streamlit secrets if not passed manually
+        self.api_key = api_key or get_secret("ANTHROPIC_API_KEY")
 
     # ── Wardrobe grouping ────────────────────────────────────────────────────
     def _group_by_category(self):
