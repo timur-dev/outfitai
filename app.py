@@ -1,9 +1,8 @@
 import streamlit as st
-import json
 import os
 import random
-from datetime import datetime
-from engine import OutfitEngine
+from engine import OutfitEngine, get_secret
+from tryon import TryOnEngine
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -119,11 +118,12 @@ def init_state():
         "swipe_index": 0,
         "outfit_suggestions": [],
         "page": "home",
-        "api_key": "",
         "style_profile": None,
-        "swipe_history": [],   # list of {"item": {...}, "action": "own"/"skip"/"love"}
+        "swipe_history": [],
         "occasion": "casual",
         "city": "New York",
+        "person_photo": None,        # raw bytes of uploaded photo
+        "tryon_results": {},         # outfit_index → result image bytes
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -136,28 +136,47 @@ with st.sidebar:
     st.markdown("## 👗 OutfitAI")
     st.markdown("---")
 
-    # API Key input
-    api_key = st.text_input(
-        "🔑 Anthropic API Key",
-        value=st.session_state.api_key,
-        type="password",
-        placeholder="sk-ant-...",
-        help="Get yours at console.anthropic.com"
-    )
-    if api_key:
-        st.session_state.api_key = api_key
-        st.success("✓ Key saved")
+    # ── API status (auto-loaded from secrets) ────────────────────────────────
+    anthropic_key = get_secret("ANTHROPIC_API_KEY")
+    fashn_key     = get_secret("FASHN_API_KEY")
+
+    if anthropic_key:
+        st.success("✓ Claude API connected")
+    else:
+        st.warning("⚠️ No Anthropic key in secrets")
+
+    if fashn_key:
+        st.success("✓ FASHN Try-On connected")
+    else:
+        st.warning("⚠️ No FASHN key in secrets")
 
     st.markdown("---")
 
-    # Navigation
+    # ── Photo Upload ─────────────────────────────────────────────────────────
+    st.markdown("### 📸 Your Photo")
+    uploaded = st.file_uploader(
+        "Upload a full-body photo",
+        type=["jpg", "jpeg", "png"],
+        help="Best results: stand facing forward, plain background, full body visible"
+    )
+    if uploaded:
+        st.session_state.person_photo = uploaded.read()
+        st.image(st.session_state.person_photo, caption="Your photo", use_column_width=True)
+        st.success("✓ Photo ready for try-on!")
+    elif st.session_state.person_photo:
+        st.image(st.session_state.person_photo, caption="Your photo", use_column_width=True)
+
+    st.markdown("---")
+
+    # ── Navigation ───────────────────────────────────────────────────────────
     st.markdown("### Navigation")
     pages = {
-        "🏠 Home": "home",
-        "👕 Build Wardrobe": "wardrobe_builder",
-        "🗃️ My Wardrobe": "my_wardrobe",
-        "✨ Get Outfit": "outfit",
-        "📊 Style Profile": "profile",
+        "🏠 Home":              "home",
+        "👕 Build Wardrobe":    "wardrobe_builder",
+        "🗃️ My Wardrobe":      "my_wardrobe",
+        "✨ Get Outfit":        "outfit",
+        "👗 Virtual Try-On":    "tryon",
+        "📊 Style Profile":     "profile",
     }
     for label, page_key in pages.items():
         if st.button(label, use_container_width=True,
@@ -167,7 +186,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Quick stats
+    # ── Quick stats ──────────────────────────────────────────────────────────
     st.markdown("### My Stats")
     wc = len(st.session_state.wardrobe)
     sc = len(st.session_state.outfit_suggestions)
@@ -427,9 +446,6 @@ def page_outfit():
             st.rerun()
         return
 
-    if not st.session_state.api_key:
-        st.warning("⚠️ Add your Anthropic API key in the sidebar to get AI styling explanations.")
-
     # Settings summary
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -447,10 +463,10 @@ def page_outfit():
                 wardrobe=wardrobe,
                 occasion=st.session_state.occasion,
                 city=st.session_state.city,
-                api_key=st.session_state.api_key
             )
             suggestions = engine.generate(n=3)
             st.session_state.outfit_suggestions = suggestions
+            st.session_state.tryon_results = {}   # clear old try-on results
         st.rerun()
 
     if not st.session_state.outfit_suggestions:
@@ -496,15 +512,10 @@ def page_outfit():
 
             with col_b:
                 st.markdown("**Color Palette**")
-                colors = outfit.get("color_palette", [])
-                color_html = ""
-                for c in colors:
-                    color_html += f'<span class="tag">🎨 {c}</span> '
+                color_html = "".join(f'<span class="tag">🎨 {c}</span> ' for c in outfit.get("color_palette", []))
                 st.markdown(color_html, unsafe_allow_html=True)
-
                 st.markdown("**Color Rule Applied**")
                 st.markdown(f'<span class="tag">✓ {outfit.get("color_rule", "Coordinated")}</span>', unsafe_allow_html=True)
-
                 st.markdown("**Occasion Fit**")
                 st.markdown(f'<span class="tag">✓ {outfit.get("occasion_fit", "Good match")}</span>', unsafe_allow_html=True)
 
@@ -517,31 +528,35 @@ def page_outfit():
                     <div style="color:#e9d5ff;line-height:1.7">{outfit['ai_explanation']}</div>
                 </div>
                 """, unsafe_allow_html=True)
-            elif st.session_state.api_key:
+            else:
                 if st.button(f"💬 Get AI Explanation", key=f"explain_{i}"):
                     with st.spinner("Claude is styling..."):
-                        engine = OutfitEngine(
-                            wardrobe=wardrobe,
-                            occasion=st.session_state.occasion,
-                            city=st.session_state.city,
-                            api_key=st.session_state.api_key
-                        )
+                        engine = OutfitEngine(wardrobe=wardrobe,
+                                             occasion=st.session_state.occasion,
+                                             city=st.session_state.city)
                         explanation = engine.explain_outfit(outfit)
                         st.session_state.outfit_suggestions[i]["ai_explanation"] = explanation
                     st.rerun()
-            else:
-                st.caption("🔑 Add API key in sidebar for AI styling explanation")
 
             # Action buttons
             st.markdown("")
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 if st.button("✅ Wearing This!", key=f"wear_{i}", type="primary", use_container_width=True):
-                    st.success("Great choice! Outfit saved to your history. 🎉")
+                    st.success("Great choice! 🎉")
             with c2:
                 if st.button("🔄 Try Another", key=f"skip_{i}", type="secondary", use_container_width=True):
                     st.session_state.outfit_suggestions = []
+                    st.session_state.tryon_results = {}
                     st.rerun()
+            with c3:
+                if st.button("👗 Virtual Try-On", key=f"tryon_btn_{i}", type="primary", use_container_width=True):
+                    if not st.session_state.person_photo:
+                        st.warning("📸 Upload your photo in the sidebar first!")
+                    else:
+                        st.session_state.page = "tryon"
+                        st.session_state["tryon_outfit_index"] = i
+                        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -625,6 +640,139 @@ def page_profile():
             st.markdown(f"- {gap}")
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: VIRTUAL TRY-ON
+# ═══════════════════════════════════════════════════════════════════════════════
+def page_tryon():
+    st.markdown("## 👗 Virtual Try-On")
+    st.markdown("See the outfit on your photo — powered by FASHN AI.")
+    st.markdown("---")
+
+    fashn_key = get_secret("FASHN_API_KEY")
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+    if not fashn_key:
+        st.error("⚠️ FASHN_API_KEY not found in Streamlit secrets. Add it in Settings → Secrets.")
+        return
+
+    if not st.session_state.person_photo:
+        st.warning("📸 Upload your photo in the sidebar first!")
+        return
+
+    if not st.session_state.outfit_suggestions:
+        st.warning("✨ Generate an outfit first — go to **Get Outfit**.")
+        if st.button("Go to Get Outfit"):
+            st.session_state.page = "outfit"
+            st.rerun()
+        return
+
+    # ── Outfit selector ───────────────────────────────────────────────────────
+    outfit_labels = [
+        f"🥇 Outfit 1 (score {st.session_state.outfit_suggestions[0]['score']}/100)",
+        f"🥈 Outfit 2 (score {st.session_state.outfit_suggestions[1]['score']}/100)" if len(st.session_state.outfit_suggestions) > 1 else None,
+        f"🥉 Outfit 3 (score {st.session_state.outfit_suggestions[2]['score']}/100)" if len(st.session_state.outfit_suggestions) > 2 else None,
+    ]
+    outfit_labels = [l for l in outfit_labels if l]
+    default_idx = st.session_state.get("tryon_outfit_index", 0)
+
+    selected_label = st.selectbox("Choose outfit to try on:", outfit_labels, index=min(default_idx, len(outfit_labels)-1))
+    outfit_idx = outfit_labels.index(selected_label)
+    outfit = st.session_state.outfit_suggestions[outfit_idx]
+
+    # ── Show chosen outfit items ──────────────────────────────────────────────
+    st.markdown("#### Outfit to try on:")
+    item_cols = st.columns(len(outfit["items"]))
+    for j, item in enumerate(outfit["items"]):
+        with item_cols[j]:
+            st.markdown(f"""
+            <div class="wardrobe-card">
+                <div style="font-size:2rem">{item['emoji']}</div>
+                <div style="font-weight:700;color:#e9d5ff;font-size:0.9rem">{item['name']}</div>
+                <div style="color:#9ca3af;font-size:0.8rem">{item['color']}</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Side-by-side: your photo | result ────────────────────────────────────
+    col_before, col_after = st.columns(2)
+    with col_before:
+        st.markdown("**Your photo**")
+        st.image(st.session_state.person_photo, use_column_width=True)
+
+    with col_after:
+        st.markdown("**With outfit**")
+        result_key = f"tryon_{outfit_idx}"
+        cached = st.session_state.tryon_results.get(result_key)
+
+        if cached:
+            st.image(cached, use_column_width=True)
+            st.success("✅ Try-on complete!")
+        else:
+            st.markdown("""
+            <div class="outfit-card" style="text-align:center;min-height:300px;display:flex;align-items:center;justify-content:center">
+                <div>
+                    <div style="font-size:3rem">👗</div>
+                    <div style="color:#9ca3af;margin-top:12px">Click below to generate</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Generate button ───────────────────────────────────────────────────────
+    if not cached:
+        if st.button("✨ Generate Try-On", type="primary", use_container_width=True):
+            # Only try-on wearable items (tops, bottoms, dresses)
+            tryable = [i for i in outfit["items"]
+                       if i["category"] in ("tops", "bottoms", "dresses")]
+
+            if not tryable:
+                st.error("No tops or bottoms found in this outfit to try on.")
+                return
+
+            progress = st.progress(0, text="🔄 Starting try-on pipeline...")
+
+            engine = TryOnEngine(
+                fashn_api_key=fashn_key,
+                anthropic_api_key=get_secret("ANTHROPIC_API_KEY"),
+            )
+
+            progress.progress(10, text="🎨 Generating garment images...")
+            result = engine.run(
+                person_image_bytes=st.session_state.person_photo,
+                outfit_items=tryable,
+            )
+            progress.progress(100, text="✅ Done!")
+
+            if result["success"] and result["result_image"]:
+                st.session_state.tryon_results[result_key] = result["result_image"]
+                st.rerun()
+            else:
+                st.error(f"Try-on failed: {result.get('error', 'Unknown error')}")
+                st.caption("Check your FASHN API credits at fashn.ai/dashboard")
+    else:
+        # Download button
+        st.download_button(
+            label="⬇️ Download Try-On Photo",
+            data=cached,
+            file_name=f"outfitai_tryon_outfit{outfit_idx+1}.jpg",
+            mime="image/jpeg",
+            use_container_width=True,
+        )
+        if st.button("🔄 Re-generate", type="secondary", use_container_width=True):
+            del st.session_state.tryon_results[result_key]
+            st.rerun()
+
+    # ── AI Explanation ────────────────────────────────────────────────────────
+    if outfit.get("ai_explanation"):
+        st.markdown("")
+        st.markdown(f"""
+        <div class="outfit-card">
+            <div style="font-size:1rem;margin-bottom:8px">🤖 <strong style="color:#a78bfa">Why This Works</strong></div>
+            <div style="color:#e9d5ff;line-height:1.7">{outfit['ai_explanation']}</div>
+        </div>""", unsafe_allow_html=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROUTER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -637,5 +785,7 @@ elif page == "my_wardrobe":
     page_my_wardrobe()
 elif page == "outfit":
     page_outfit()
+elif page == "tryon":
+    page_tryon()
 elif page == "profile":
     page_profile()
