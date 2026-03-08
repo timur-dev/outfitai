@@ -1,74 +1,68 @@
-import streamlit as st, random, io, base64
+import streamlit as st
+import random
+import base64
+import json
 
 # ── Safe imports ──────────────────────────────────────────────────────────────
 try:
     from engine import OutfitEngine, get_secret
-except Exception as e:
-    st.error(f"❌ engine.py import error: {e}")
+except ImportError as _e:
+    st.error(f"engine.py import error: {_e}")
     st.stop()
 
 try:
     from tryon import TryOnEngine
     TRYON_OK = True
-except Exception as e:
+except ImportError:
     TRYON_OK = False
 
 try:
     import anthropic
     ANTHROPIC_OK = True
-except Exception:
+except ImportError:
     ANTHROPIC_OK = False
 
-# ── Use Claude vision to extract clothing from uploaded photo ─────────────────
-def extract_clothing_from_photo(image_bytes: bytes, api_key: str) -> list:
-    """
-    Send photo to Claude Vision. Ask it to identify distinct clothing items.
-    Returns list of dicts: {name, category, color, styles, occasions, formality}
-    """
+
+def _parse_claude_json(text):
+    text = text.strip()
+    if "```" in text:
+        for part in text.split("```"):
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("[") or part.startswith("{"):
+                return json.loads(part)
+    return json.loads(text)
+
+
+def extract_clothing_from_photo(image_bytes, api_key):
     if not api_key or not ANTHROPIC_OK:
-        return []
+        return [], "Anthropic API key missing or library not installed"
+    prompt = (
+        "Analyze this clothing photo. Identify every distinct garment. "
+        "Return ONLY a raw JSON array — no markdown, no explanation. Format:\n"
+        '[{"name":"White T-Shirt","category":"tops","color":"White",'
+        '"styles":["casual"],"occasions":["casual"],"formality":1}]\n'
+        "category: tops | bottoms | outerwear | footwear | dresses | accessories\n"
+        "formality: 1=casual to 5=formal"
+    )
     try:
         client = anthropic.Anthropic(api_key=api_key)
         b64 = base64.b64encode(image_bytes).decode()
         msg = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image",
-                     "source": {"type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": b64}},
-                    {"type": "text",
-                     "text": """Analyze this clothing photo and identify each distinct garment visible.
-For EACH item return a JSON array (and nothing else) like:
-[
-  {
-    "name": "White T-Shirt",
-    "category": "tops",
-    "color": "White",
-    "styles": ["casual","minimal"],
-    "occasions": ["casual","active"],
-    "formality": 1
-  }
-]
-Categories must be one of: tops, bottoms, outerwear, footwear, dresses, accessories
-Formality: 1=very casual, 5=very formal
-Return ONLY the JSON array, no explanation."""}
-                ]
-            }]
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": prompt}
+            ]}]
         )
-        import json
-        text = msg.content[0].text.strip()
-        # Strip markdown fences if present
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
-    except Exception as e:
-        return []
+        items = _parse_claude_json(msg.content[0].text)
+        return items, None
+    except Exception as err:
+        return [], str(err)
+
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="OutfitAI", page_icon="👗", layout="wide",
@@ -107,14 +101,13 @@ DEFAULTS = {
     "city": "New York", "person_photo": None, "tryon_results": {},
     "tryon_outfit_index": 0,
 }
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+for _k, _v in DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-# Collect all sidebar interactions FIRST, handle navigation AFTER the with block
-_nav_clicked   = None
-_remove_photo  = False
+# ── Sidebar — collect clicks, rerun AFTER the with block ─────────────────────
+_nav_clicked  = None
+_remove_photo = False
 
 with st.sidebar:
     st.markdown("## 👗 OutfitAI")
@@ -126,29 +119,27 @@ with st.sidebar:
     if anthropic_key:
         st.success("✓ Claude AI connected")
     else:
-        st.warning("⚠️ No Anthropic key in Secrets")
+        st.warning("⚠️ Add ANTHROPIC_API_KEY to Secrets")
 
     if fashn_key:
         st.success("✓ FASHN Try-On connected")
     else:
-        st.warning("⚠️ No FASHN key in Secrets")
+        st.warning("⚠️ Add FASHN_API_KEY to Secrets")
 
     st.markdown("---")
-
     st.markdown("### 📸 Your Photo")
-    up = st.file_uploader("Full-body photo", type=["jpg","jpeg","png"],
-                           key="sidebar_photo_upload")
-    if up:
-        st.session_state.person_photo = up.read()
+    _up = st.file_uploader("Full-body photo", type=["jpg","jpeg","png"],
+                            key="sidebar_photo_upload")
+    if _up:
+        st.session_state.person_photo = _up.read()
     if st.session_state.person_photo:
-        st.image(st.session_state.person_photo, use_column_width=True)
+        st.image(st.session_state.person_photo, width=250)
         st.caption("✓ Ready for try-on")
         if st.button("🗑 Remove photo", use_container_width=True, key="remove_photo"):
             _remove_photo = True
 
     st.markdown("---")
     st.markdown("### Navigation")
-
     NAV = [
         ("🏠 Home",             "home"),
         ("👕 Build Wardrobe",   "wardrobe_builder"),
@@ -157,36 +148,33 @@ with st.sidebar:
         ("👗 Virtual Try-On",   "tryon"),
         ("📊 Style Profile",    "profile"),
     ]
-    for label, pkey in NAV:
-        t = "primary" if st.session_state.page == pkey else "secondary"
-        if st.button(label, use_container_width=True, type=t, key=f"nav_{pkey}"):
-            _nav_clicked = pkey   # just record — don't rerun inside sidebar
+    for _label, _pkey in NAV:
+        _t = "primary" if st.session_state.page == _pkey else "secondary"
+        if st.button(_label, use_container_width=True, type=_t, key=f"nav_{_pkey}"):
+            _nav_clicked = _pkey   # record only — NO rerun inside sidebar
 
     st.markdown("---")
-    wc = len(st.session_state.wardrobe)
-    sc = len(st.session_state.outfit_suggestions)
-    c1, c2 = st.columns(2)
-    c1.markdown(f'<div class="metric-box"><div class="metric-value">{wc}</div>'
-                f'<div class="metric-label">Items</div></div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="metric-box"><div class="metric-value">{sc}</div>'
-                f'<div class="metric-label">Outfits</div></div>', unsafe_allow_html=True)
-
+    _wc = len(st.session_state.wardrobe)
+    _sc = len(st.session_state.outfit_suggestions)
+    _c1, _c2 = st.columns(2)
+    _c1.markdown(f'<div class="metric-box"><div class="metric-value">{_wc}</div>'
+                 f'<div class="metric-label">Items</div></div>', unsafe_allow_html=True)
+    _c2.markdown(f'<div class="metric-box"><div class="metric-value">{_sc}</div>'
+                 f'<div class="metric-label">Outfits</div></div>', unsafe_allow_html=True)
     st.markdown("---")
     st.session_state.city = st.text_input("📍 City", value=st.session_state.city)
-    occ_list = ["casual","work","date","formal","active","travel"]
+    _occ_list = ["casual","work","date","formal","active","travel"]
     st.session_state.occasion = st.selectbox(
-        "🎯 Occasion", occ_list,
-        index=occ_list.index(st.session_state.occasion))
+        "🎯 Occasion", _occ_list,
+        index=_occ_list.index(st.session_state.occasion))
 
-# ── Handle sidebar actions OUTSIDE the with block — safe to rerun here ────────
+# ── Handle sidebar actions AFTER the with block (safe to rerun here) ─────────
 if _remove_photo:
     st.session_state.person_photo = None
     st.rerun()
-
 if _nav_clicked:
     st.session_state.page = _nav_clicked
     st.rerun()
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -202,40 +190,37 @@ def page_home():
         st.markdown('<div class="outfit-card"><div style="font-size:2rem">👕</div>'
                     '<h3 style="color:#e9d5ff">Build Wardrobe</h3>'
                     '<p style="color:#9ca3af">Swipe cards or upload clothing photos '
-                    '— AI extracts each item automatically.</p></div>',
-                    unsafe_allow_html=True)
-        btn_build = st.button("→ Build Wardrobe", key="home_build", use_container_width=True)
+                    '— AI auto-extracts each item.</p></div>', unsafe_allow_html=True)
+        _b1 = st.button("→ Build Wardrobe", key="home_build", use_container_width=True)
     with c2:
         st.markdown('<div class="outfit-card"><div style="font-size:2rem">🤖</div>'
                     '<h3 style="color:#e9d5ff">AI Styling</h3>'
-                    '<p style="color:#9ca3af">Color theory, weather + occasion '
-                    'intelligence combined into one outfit score.</p></div>',
-                    unsafe_allow_html=True)
-        btn_outfit = st.button("→ Get Outfit", key="home_outfit", use_container_width=True)
+                    '<p style="color:#9ca3af">Color theory + occasion intelligence '
+                    'combined into one outfit score.</p></div>', unsafe_allow_html=True)
+        _b2 = st.button("→ Get Outfit", key="home_outfit", use_container_width=True)
     with c3:
         st.markdown('<div class="outfit-card"><div style="font-size:2rem">👗</div>'
                     '<h3 style="color:#e9d5ff">Virtual Try-On</h3>'
                     '<p style="color:#9ca3af">See the outfit on your actual photo '
-                    'powered by FASHN AI in ~15 seconds.</p></div>',
-                    unsafe_allow_html=True)
-        btn_tryon = st.button("→ Try-On", key="home_tryon", use_container_width=True)
+                    'via FASHN AI in ~15 seconds.</p></div>', unsafe_allow_html=True)
+        _b3 = st.button("→ Try-On", key="home_tryon", use_container_width=True)
 
-    # Handle AFTER columns close — rerun is safe here
-    if btn_build:
+    # Rerun AFTER columns close
+    if _b1:
         st.session_state.page = "wardrobe_builder"; st.rerun()
-    if btn_outfit:
+    if _b2:
         st.session_state.page = "outfit"; st.rerun()
-    if btn_tryon:
+    if _b3:
         st.session_state.page = "tryon"; st.rerun()
 
     st.markdown("---")
     wc = len(st.session_state.wardrobe)
     if wc == 0:
-        st.info("👈 Start by building your wardrobe in the sidebar navigation.")
+        st.info("👈 Start by building your wardrobe.")
     elif wc < 3:
-        st.warning(f"You have {wc} item(s). Add at least 3 for outfit suggestions.")
+        st.warning(f"You have {wc} item(s) — add at least 3 for outfit suggestions.")
     else:
-        st.success(f"✅ {wc} items ready. Head to **Get Outfit** for today's look!")
+        st.success(f"✅ {wc} items ready. Go to **Get Outfit** for today's look!")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -244,46 +229,47 @@ def page_home():
 def page_wardrobe_builder():
     from catalog import CATALOG
     st.markdown("## 👕 Build Your Wardrobe")
-    tab_swipe, tab_upload = st.tabs(["👆 Swipe Cards", "📷 Upload & Auto-Extract"])
+    tab_swipe, tab_upload = st.tabs(["👆 Swipe Cards", "📷 Upload & AI Extract"])
 
     # ── TAB 1: SWIPE ──────────────────────────────────────────────────────────
     with tab_swipe:
         st.markdown("Swipe through clothing cards — tell us what you own.")
-        idx = st.session_state.swipe_index
+        idx   = st.session_state.swipe_index
         total = len(CATALOG)
 
         if idx >= total:
             st.balloons()
             owned = [s for s in st.session_state.swipe_history
                      if s["action"] in ("own","love")]
-            st.success(f"🎉 Done! {len(owned)} items added to your wardrobe.")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🔄 Start Over", type="secondary", use_container_width=True):
-                    st.session_state.swipe_index = 0
-                    st.session_state.swipe_history = []
-                    st.rerun()
-            with col2:
-                if st.button("✨ Get Outfit", type="primary", use_container_width=True):
-                    st.session_state.page = "outfit"; st.rerun()
+            st.success(f"🎉 Done! {len(owned)} items in your wardrobe.")
+            c1, c2 = st.columns(2)
+            _s1 = c1.button("🔄 Start Over", type="secondary",
+                             use_container_width=True, key="swipe_restart")
+            _s2 = c2.button("✨ Get Outfit", type="primary",
+                             use_container_width=True, key="swipe_get_outfit")
+            if _s1:
+                st.session_state.swipe_index = 0
+                st.session_state.swipe_history = []
+                st.rerun()
+            if _s2:
+                st.session_state.page = "outfit"; st.rerun()
         else:
             item = CATALOG[idx]
-            st.progress(idx/total, text=f"Card {idx+1} of {total} — {item['category']}")
-
-            _, cc, _ = st.columns([1,2,1])
+            st.progress(idx / total, text=f"Card {idx+1} of {total} — {item['category']}")
+            _, cc, _ = st.columns([1, 2, 1])
             with cc:
                 st.markdown(
                     f'<div class="swipe-card">'
                     f'<div style="font-size:5rem">{item["emoji"]}</div>'
-                    f'<div style="font-size:1.4rem;font-weight:700;color:#e9d5ff">{item["name"]}</div>'
-                    f'<div style="color:#9ca3af;font-size:0.9rem">{item["description"]}</div><br>'
+                    f'<div style="font-size:1.4rem;font-weight:700;color:#e9d5ff">'
+                    f'{item["name"]}</div>'
+                    f'<div style="color:#9ca3af;font-size:0.9rem">'
+                    f'{item["description"]}</div><br>'
                     f'{"".join(f"<span class=tag>{s}</span>" for s in item["styles"])}'
                     f'</div>', unsafe_allow_html=True)
 
-            st.markdown("")
-
             if st.session_state.get(f"show_colors_{idx}"):
-                st.markdown("#### 🎨 Pick the color(s) you own:")
+                st.markdown("#### 🎨 Which color(s) do you own?")
                 picked = st.multiselect("Colors", item["colors"],
                                         label_visibility="collapsed",
                                         key=f"cp_{idx}")
@@ -302,68 +288,60 @@ def page_wardrobe_builder():
                         }
                         if witem["id"] not in existing:
                             st.session_state.wardrobe.append(witem)
-                    st.session_state.swipe_history.append({"item":item,"action":"own"})
+                    st.session_state.swipe_history.append({"item": item, "action": "own"})
                     st.session_state[f"show_colors_{idx}"] = False
                     st.session_state.swipe_index += 1
                     st.rerun()
             else:
                 b1, b2, b3 = st.columns(3)
-                with b1:
-                    if st.button("👎 Skip", use_container_width=True,
-                                 type="secondary", key=f"skip_{idx}"):
-                        st.session_state.swipe_history.append({"item":item,"action":"skip"})
-                        st.session_state.swipe_index += 1
-                        st.rerun()
-                with b2:
-                    if st.button("👍 I Own This", use_container_width=True,
-                                 type="primary", key=f"own_{idx}"):
-                        st.session_state[f"show_colors_{idx}"] = True
-                        st.rerun()
-                with b3:
-                    if st.button("❤️ Love It", use_container_width=True,
-                                 type="primary", key=f"love_{idx}"):
-                        st.session_state[f"show_colors_{idx}"] = True
-                        st.rerun()
+                _skip  = b1.button("👎 Skip",       use_container_width=True,
+                                    type="secondary", key=f"skip_{idx}")
+                _own   = b2.button("👍 I Own This",  use_container_width=True,
+                                    type="primary",   key=f"own_{idx}")
+                _love  = b3.button("❤️ Love It",     use_container_width=True,
+                                    type="primary",   key=f"love_{idx}")
+                if _skip:
+                    st.session_state.swipe_history.append({"item": item, "action": "skip"})
+                    st.session_state.swipe_index += 1
+                    st.rerun()
+                if _own or _love:
+                    st.session_state[f"show_colors_{idx}"] = True
+                    st.rerun()
                 st.caption("👎 Don't own  |  👍 Own it  |  ❤️ Favorite")
 
             with st.expander("⚡ Quick Add Basics"):
                 if st.button("Add White T-Shirt + Black Jeans + White Sneakers",
                              key="quick_basics"):
                     basics = [
-                        {"id":"tshirt_white","name":"T-Shirt","category":"tops",
-                         "color":"White","emoji":"👕","styles":["casual","minimal"],
-                         "occasions":["casual","active"],"formality":1,
-                         "source":"quick","uploaded_image":None},
-                        {"id":"jeans_black","name":"Jeans","category":"bottoms",
-                         "color":"Black","emoji":"👖","styles":["casual","versatile"],
-                         "occasions":["casual","work"],"formality":2,
-                         "source":"quick","uploaded_image":None},
-                        {"id":"sneakers_white","name":"Sneakers","category":"footwear",
-                         "color":"White","emoji":"👟","styles":["casual","sporty"],
-                         "occasions":["casual","active"],"formality":1,
-                         "source":"quick","uploaded_image":None},
+                        {"id": "tshirt_white", "name": "T-Shirt", "category": "tops",
+                         "color": "White", "emoji": "👕", "styles": ["casual", "minimal"],
+                         "occasions": ["casual", "active"], "formality": 1,
+                         "source": "quick", "uploaded_image": None},
+                        {"id": "jeans_black", "name": "Jeans", "category": "bottoms",
+                         "color": "Black", "emoji": "👖", "styles": ["casual", "versatile"],
+                         "occasions": ["casual", "work"], "formality": 2,
+                         "source": "quick", "uploaded_image": None},
+                        {"id": "sneakers_white", "name": "Sneakers", "category": "footwear",
+                         "color": "White", "emoji": "👟", "styles": ["casual", "sporty"],
+                         "occasions": ["casual", "active"], "formality": 1,
+                         "source": "quick", "uploaded_image": None},
                     ]
                     existing = {w["id"] for w in st.session_state.wardrobe}
-                    added = 0
-                    for b in basics:
-                        if b["id"] not in existing:
-                            st.session_state.wardrobe.append(b)
-                            added += 1
-                    st.success(f"✅ Added {added} basic item(s)!")
+                    added = sum(1 for b in basics
+                                if b["id"] not in existing
+                                and not st.session_state.wardrobe.append(b))
+                    st.success(f"✅ Basics added!")
                     st.rerun()
 
-    # ── TAB 2: PHOTO UPLOAD + AUTO-EXTRACT ───────────────────────────────────
+    # ── TAB 2: PHOTO UPLOAD + AI EXTRACT ─────────────────────────────────────
     with tab_upload:
-        st.markdown("Upload a photo of a clothing item — "
-                    "**Claude Vision extracts it automatically**.")
-
+        st.markdown("Upload a clothing photo — **Claude Vision identifies each item automatically.**")
         if not anthropic_key:
-            st.warning("⚠️ Anthropic API key required for auto-extraction. "
-                       "Add it to Streamlit Secrets.")
+            st.warning("⚠️ ANTHROPIC_API_KEY needed for AI extraction.")
 
         files = st.file_uploader(
             "Upload clothing photo(s)",
-            type=["jpg","jpeg","png"],
+            type=["jpg", "jpeg", "png"],
             accept_multiple_files=True,
             key="wardrobe_upload"
         )
@@ -375,80 +353,73 @@ def page_wardrobe_builder():
                 col_img, col_info = st.columns([1, 2])
 
                 with col_img:
-                    st.image(img_bytes, use_column_width=True)
+                    st.image(img_bytes, width=200)
 
                 with col_info:
-                    # Auto-extract button
                     extract_key = f"extracted_{f.name}"
-                    if st.button(f"🤖 Auto-Extract with AI", key=f"extract_{f.name}",
-                                 type="primary", use_container_width=True):
-                        with st.spinner("Claude is analyzing your clothing…"):
-                            items = extract_clothing_from_photo(img_bytes, anthropic_key)
-                            if items:
-                                st.session_state[extract_key] = items
-                                st.success(f"✅ Found {len(items)} item(s)!")
-                            else:
-                                st.error("Could not extract items. "
-                                         "Try manual entry below.")
 
-                    # Show extracted items with confirm buttons
+                    if st.button("🤖 Extract with AI", key=f"extract_{f.name}",
+                                 type="primary", use_container_width=True):
+                        with st.spinner("Claude is analyzing your photo…"):
+                            items, err = extract_clothing_from_photo(img_bytes, anthropic_key)
+                        if items:
+                            st.session_state[extract_key] = items
+                            st.success(f"✅ Found {len(items)} item(s)!")
+                            st.rerun()
+                        else:
+                            st.error(f"Extraction failed: {err}")
+
                     if extract_key in st.session_state:
-                        for ei, extracted in enumerate(st.session_state[extract_key]):
-                            with st.container():
-                                st.markdown(f"**{extracted['name']}** — "
-                                            f"{extracted['color']} | "
-                                            f"{extracted['category']}")
-                                if st.button(f"➕ Add to Wardrobe",
-                                             key=f"add_ext_{f.name}_{ei}",
-                                             use_container_width=True):
-                                    item_id = f"photo_{f.name}_{ei}_{extracted['color']}"
-                                    existing = {w["id"] for w in st.session_state.wardrobe}
-                                    if item_id not in existing:
-                                        st.session_state.wardrobe.append({
-                                            "id":             item_id,
-                                            "name":           extracted["name"],
-                                            "category":       extracted["category"],
-                                            "color":          extracted["color"],
-                                            "emoji":          "📷",
-                                            "styles":         extracted.get("styles",["versatile"]),
-                                            "occasions":      extracted.get("occasions",["casual"]),
-                                            "formality":      extracted.get("formality", 2),
-                                            "source":         "photo_upload",
-                                            "uploaded_image": img_bytes,
-                                        })
-                                        st.success(f"✅ {extracted['name']} added!")
-                                        st.rerun()
+                        for ei, ex in enumerate(st.session_state[extract_key]):
+                            st.markdown(
+                                f"**{ex['name']}** — {ex['color']} | {ex['category']}")
+                            if st.button(f"➕ Add to Wardrobe",
+                                         key=f"add_ext_{f.name}_{ei}",
+                                         use_container_width=True):
+                                item_id = f"photo_{f.name}_{ei}".replace(" ", "_")
+                                existing = {w["id"] for w in st.session_state.wardrobe}
+                                if item_id not in existing:
+                                    st.session_state.wardrobe.append({
+                                        "id": item_id,
+                                        "name": ex["name"],
+                                        "category": ex["category"],
+                                        "color": ex["color"],
+                                        "emoji": "📷",
+                                        "styles": ex.get("styles", ["versatile"]),
+                                        "occasions": ex.get("occasions", ["casual"]),
+                                        "formality": ex.get("formality", 2),
+                                        "source": "photo_upload",
+                                        "uploaded_image": img_bytes,
+                                    })
+                                    st.success(f"✅ {ex['name']} added!")
+                                    st.rerun()
 
                     st.markdown("**— or add manually —**")
-                    name     = st.text_input("Name", value="My Item",
-                                             key=f"mn_{f.name}")
-                    cat      = st.selectbox("Category",
-                                            ["tops","bottoms","outerwear",
-                                             "footwear","dresses","accessories"],
-                                            key=f"mc_{f.name}")
-                    color    = st.text_input("Color", value="Black",
-                                             key=f"mcol_{f.name}")
-                    occasion = st.multiselect("Occasions",
-                                             ["casual","work","date","formal",
-                                              "active","travel"],
-                                             default=["casual"],
-                                             key=f"mocc_{f.name}")
-                    formality = st.slider("Formality", 1, 5, 2, key=f"mf_{f.name}")
+                    m_name = st.text_input("Name", value="My Item",
+                                           key=f"mn_{f.name}")
+                    m_cat  = st.selectbox("Category",
+                                          ["tops","bottoms","outerwear",
+                                           "footwear","dresses","accessories"],
+                                          key=f"mc_{f.name}")
+                    m_col  = st.text_input("Color", value="Black", key=f"mcol_{f.name}")
+                    m_occ  = st.multiselect("Occasions",
+                                            ["casual","work","date","formal","active","travel"],
+                                            default=["casual"], key=f"mocc_{f.name}")
+                    m_form = st.slider("Formality", 1, 5, 2, key=f"mf_{f.name}")
 
-                    if st.button(f"➕ Add Manually", key=f"addm_{f.name}",
+                    if st.button("➕ Add Manually", key=f"addm_{f.name}",
                                  use_container_width=True):
-                        item_id = f"manual_{f.name}_{color}".replace(" ","_")
+                        item_id = f"manual_{f.name}_{m_col}".replace(" ", "_")
                         existing = {w["id"] for w in st.session_state.wardrobe}
                         if item_id not in existing:
                             st.session_state.wardrobe.append({
-                                "id": item_id, "name": name,
-                                "category": cat, "color": color,
+                                "id": item_id, "name": m_name,
+                                "category": m_cat, "color": m_col,
                                 "emoji": "📷", "styles": ["versatile"],
-                                "occasions": occasion, "formality": formality,
-                                "source": "photo_upload",
-                                "uploaded_image": img_bytes,
+                                "occasions": m_occ, "formality": m_form,
+                                "source": "photo_upload", "uploaded_image": img_bytes,
                             })
-                            st.success(f"✅ {name} added!")
+                            st.success(f"✅ {m_name} added!")
                             st.rerun()
                         else:
                             st.warning("Already in wardrobe.")
@@ -461,14 +432,13 @@ def page_my_wardrobe():
     st.markdown("## 🗃️ My Wardrobe")
     wardrobe = st.session_state.wardrobe
     if not wardrobe:
-        st.info("Wardrobe is empty — go to **Build Wardrobe**.")
+        st.info("Wardrobe is empty.")
         if st.button("👕 Build Wardrobe", type="primary"):
             st.session_state.page = "wardrobe_builder"; st.rerun()
         return
 
-    st.markdown(f"**{len(wardrobe)} items** in your wardrobe")
+    st.markdown(f"**{len(wardrobe)} items**")
     st.markdown("---")
-
     cats = {}
     for item in wardrobe:
         cats.setdefault(item["category"], []).append(item)
@@ -479,7 +449,7 @@ def page_my_wardrobe():
         for i, item in enumerate(items):
             with cols[i % 4]:
                 if item.get("uploaded_image"):
-                    st.image(item["uploaded_image"], use_column_width=True)
+                    st.image(item["uploaded_image"], width=140)
                 else:
                     st.markdown(
                         f'<div class="wardrobe-card">'
@@ -494,7 +464,7 @@ def page_my_wardrobe():
                     st.rerun()
 
     st.markdown("---")
-    if st.button("🗑️ Clear All", type="secondary"):
+    if st.button("🗑️ Clear All Wardrobe", type="secondary"):
         st.session_state.wardrobe = []
         st.rerun()
 
@@ -513,7 +483,7 @@ def page_outfit():
         return
 
     c1, c2, c3 = st.columns(3)
-    c1.markdown(f'<div class="metric-box"><div class="metric-value">🌤</div>'
+    c1.markdown(f'<div class="metric-box"><div class="metric-value">📍</div>'
                 f'<div class="metric-label">{st.session_state.city}</div></div>',
                 unsafe_allow_html=True)
     c2.markdown(f'<div class="metric-box"><div class="metric-value">🎯</div>'
@@ -521,8 +491,8 @@ def page_outfit():
                 unsafe_allow_html=True)
     c3.markdown(f'<div class="metric-box"><div class="metric-value">{len(wardrobe)}</div>'
                 f'<div class="metric-label">Items</div></div>', unsafe_allow_html=True)
-    st.markdown("")
 
+    st.markdown("")
     if st.button("🎲 Generate Outfit", type="primary", use_container_width=True):
         with st.spinner("🤖 Building your outfit…"):
             try:
@@ -531,31 +501,34 @@ def page_outfit():
                     occasion=st.session_state.occasion,
                     city=st.session_state.city,
                 )
-                suggestions = engine.generate(n=3)
-                st.session_state.outfit_suggestions = suggestions
+                results = engine.generate(n=3)
+                if not results:
+                    st.warning("⚠️ No outfit combinations found. "
+                               "Make sure you have tops AND bottoms (or a dress) in your wardrobe.")
+                    st.stop()
+                st.session_state.outfit_suggestions = results
                 st.session_state.tryon_results = {}
-            except Exception as e:
-                st.error(f"Outfit engine error: {e}")
-                return
+            except Exception as _err:
+                import traceback
+                st.error(f"Outfit engine error: {_err}")
+                st.code(traceback.format_exc())
+                st.stop()
         st.rerun()
 
     if not st.session_state.outfit_suggestions:
-        st.info("👆 Click **Generate Outfit** to get your suggestions.")
+        st.info("👆 Click **Generate Outfit** above.")
         return
 
     st.markdown("---")
-    st.markdown("### Your Outfit Options")
-
     for i, outfit in enumerate(st.session_state.outfit_suggestions):
         rank = ["🥇","🥈","🥉"][i]
         with st.expander(f"{rank} Outfit {i+1}  —  Score: {outfit['score']}/100",
-                         expanded=(i==0)):
-            # Item thumbnails — real photo if uploaded, else emoji card
+                         expanded=(i == 0)):
             icols = st.columns(max(len(outfit["items"]), 1))
             for j, item in enumerate(outfit["items"]):
                 with icols[j]:
                     if item.get("uploaded_image"):
-                        st.image(item["uploaded_image"], use_column_width=True)
+                        st.image(item["uploaded_image"], width=130)
                         st.caption(f"{item['name']} · {item['color']}")
                     else:
                         st.markdown(
@@ -569,24 +542,24 @@ def page_outfit():
             ca, cb = st.columns(2)
             with ca:
                 st.markdown("**Score Breakdown**")
-                for label, val in outfit.get("score_breakdown",{}).items():
+                for lbl, val in outfit.get("score_breakdown", {}).items():
                     pct = int(val)
-                    st.markdown(f"<small>{label}</small>", unsafe_allow_html=True)
+                    st.markdown(f"<small>{lbl}</small>", unsafe_allow_html=True)
                     st.markdown(
-                        f'<div class="score-bar"><div class="score-fill"'
-                        f' style="width:{pct}%"></div></div>'
+                        f'<div class="score-bar"><div class="score-fill" '
+                        f'style="width:{pct}%"></div></div>'
                         f'<small style="color:#9ca3af">{pct}/100</small>',
                         unsafe_allow_html=True)
             with cb:
                 st.markdown("**Colors**")
-                st.markdown("".join(f'<span class="tag">🎨 {c}</span> '
-                                    for c in outfit.get("color_palette",[])),
-                            unsafe_allow_html=True)
-                st.markdown("**Rule**")
-                st.markdown(f'<span class="tag">✓ {outfit.get("color_rule","—")}</span>',
-                            unsafe_allow_html=True)
+                st.markdown("".join(
+                    f'<span class="tag">🎨 {c}</span> '
+                    for c in outfit.get("color_palette", [])),
+                    unsafe_allow_html=True)
+                st.markdown(
+                    f'<span class="tag">✓ {outfit.get("color_rule","—")}</span>',
+                    unsafe_allow_html=True)
 
-            st.markdown("")
             if outfit.get("ai_explanation"):
                 st.markdown(
                     f'<div class="outfit-card">'
@@ -603,30 +576,31 @@ def page_outfit():
                                               city=st.session_state.city)
                             st.session_state.outfit_suggestions[i]["ai_explanation"] = \
                                 eng.explain_outfit(outfit)
-                        except Exception as e:
-                            st.error(f"AI explanation error: {e}")
+                        except Exception as _e2:
+                            st.error(f"AI error: {_e2}")
                     st.rerun()
 
-            st.markdown("")
             b1, b2, b3 = st.columns(3)
-            with b1:
-                if st.button("✅ Wearing This!", key=f"wear_{i}",
-                             type="primary", use_container_width=True):
-                    st.success("Great choice! 🎉")
-            with b2:
-                if st.button("🔄 Try Another", key=f"regen_{i}",
-                             type="secondary", use_container_width=True):
-                    st.session_state.outfit_suggestions = []
-                    st.session_state.tryon_results = {}
+            _wear  = b1.button("✅ Wearing This!", key=f"wear_{i}",
+                                type="primary", use_container_width=True)
+            _regen = b2.button("🔄 Try Another",  key=f"regen_{i}",
+                                type="secondary", use_container_width=True)
+            _tryon = b3.button("👗 Virtual Try-On", key=f"vto_{i}",
+                                type="primary", use_container_width=True)
+
+            if _wear:
+                st.success("Great choice! 🎉")
+            if _regen:
+                st.session_state.outfit_suggestions = []
+                st.session_state.tryon_results = {}
+                st.rerun()
+            if _tryon:
+                if not st.session_state.person_photo:
+                    st.warning("📸 Upload your photo in the sidebar first!")
+                else:
+                    st.session_state.tryon_outfit_index = i
+                    st.session_state.page = "tryon"
                     st.rerun()
-            with b3:
-                if st.button("👗 Virtual Try-On", key=f"tryon_{i}",
-                             type="primary", use_container_width=True):
-                    if not st.session_state.person_photo:
-                        st.warning("📸 Upload your photo in the sidebar first!")
-                    else:
-                        st.session_state.tryon_outfit_index = i
-                        st.session_state.page = "tryon"; st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -638,7 +612,6 @@ def page_tryon():
     st.markdown("---")
 
     fashn_key = get_secret("FASHN_API_KEY")
-
     if not fashn_key:
         st.error("⚠️ FASHN_API_KEY missing from Streamlit Secrets.")
         return
@@ -651,22 +624,20 @@ def page_tryon():
             st.session_state.page = "outfit"; st.rerun()
         return
 
-    # Outfit picker
     outfits = st.session_state.outfit_suggestions
     labels  = [f"{'🥇🥈🥉'[i]} Outfit {i+1}  (score {outfits[i]['score']}/100)"
                for i in range(len(outfits))]
-    sel = st.selectbox("Choose outfit:", labels,
-                       index=min(st.session_state.tryon_outfit_index, len(labels)-1))
-    oidx   = labels.index(sel)
+    sel  = st.selectbox("Choose outfit:", labels,
+                        index=min(st.session_state.tryon_outfit_index, len(labels)-1))
+    oidx = labels.index(sel)
     outfit = outfits[oidx]
 
-    # Show items
     st.markdown("#### Selected outfit:")
     icols = st.columns(max(len(outfit["items"]), 1))
     for j, item in enumerate(outfit["items"]):
         with icols[j]:
             if item.get("uploaded_image"):
-                st.image(item["uploaded_image"], use_column_width=True)
+                st.image(item["uploaded_image"], width=130)
             else:
                 st.markdown(
                     f'<div class="wardrobe-card">'
@@ -677,47 +648,43 @@ def page_tryon():
                     f'</div>', unsafe_allow_html=True)
 
     st.markdown("---")
-
-    col_before, col_after = st.columns(2)
-    with col_before:
+    cb, ca = st.columns(2)
+    with cb:
         st.markdown("**📸 Your photo**")
-        st.image(st.session_state.person_photo, use_column_width=True)
+        st.image(st.session_state.person_photo, width=300)
 
     result_key = f"tryon_{oidx}"
     cached     = st.session_state.tryon_results.get(result_key)
 
-    with col_after:
+    with ca:
         st.markdown("**✨ With outfit**")
         if cached:
-            st.image(cached, use_column_width=True)
+            st.image(cached, width=300)
         else:
             st.markdown(
-                '<div class="outfit-card" style="text-align:center;min-height:300px;'
+                '<div class="outfit-card" style="text-align:center;min-height:280px;'
                 'display:flex;align-items:center;justify-content:center">'
                 '<div><div style="font-size:3rem">👗</div>'
                 '<div style="color:#9ca3af;margin-top:12px">Click Generate below</div>'
                 '</div></div>', unsafe_allow_html=True)
 
     st.markdown("")
-
     if cached:
         d1, d2 = st.columns(2)
-        with d1:
-            st.download_button("⬇️ Download", data=cached,
-                               file_name=f"outfitai_outfit{oidx+1}.jpg",
-                               mime="image/jpeg", use_container_width=True)
-        with d2:
-            if st.button("🔄 Re-generate", type="secondary", use_container_width=True):
-                del st.session_state.tryon_results[result_key]
-                st.rerun()
+        d1.download_button("⬇️ Download", data=cached,
+                           file_name=f"outfitai_{oidx+1}.jpg",
+                           mime="image/jpeg", use_container_width=True)
+        if d2.button("🔄 Re-generate", type="secondary", use_container_width=True):
+            del st.session_state.tryon_results[result_key]
+            st.rerun()
     else:
         tryable = [i for i in outfit["items"]
                    if i["category"] in ("tops","bottoms","dresses")]
         if not tryable:
-            st.error("No tops or bottoms in this outfit to try on.")
+            st.error("No tops or bottoms to try on in this outfit.")
         else:
             if st.button("✨ Generate Try-On", type="primary", use_container_width=True):
-                prog = st.progress(0, text="🚀 Starting FASHN…")
+                prog = st.progress(0, text="🚀 Connecting to FASHN…")
                 engine = TryOnEngine(fashn_key)
                 result = engine.run_outfit(
                     person=st.session_state.person_photo,
@@ -732,7 +699,6 @@ def page_tryon():
                     st.caption("Check your credits at app.fashn.ai/api")
 
     if outfit.get("ai_explanation"):
-        st.markdown("")
         st.markdown(
             f'<div class="outfit-card">'
             f'<strong style="color:#a78bfa">🤖 Why This Works</strong><br><br>'
@@ -750,11 +716,9 @@ def page_profile():
     if not wardrobe:
         st.info("Build your wardrobe first.")
         return
-
     engine  = OutfitEngine(wardrobe=wardrobe, occasion="casual",
                            city=st.session_state.city)
     profile = engine.analyze_style_profile()
-
     st.markdown(
         f'<div class="outfit-card" style="text-align:center">'
         f'<div style="font-size:3rem">{profile["emoji"]}</div>'
@@ -762,24 +726,23 @@ def page_profile():
         f'{profile["archetype"]}</div>'
         f'<div style="color:#9ca3af">{profile["description"]}</div>'
         f'</div>', unsafe_allow_html=True)
-
     st.markdown("")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### 🎨 Dominant Colors")
-        for color, cnt in profile.get("dominant_colors",[])[:8]:
-            st.markdown(f"**{color}** — {cnt} item{'s' if cnt>1 else ''}")
+        for color, cnt in profile.get("dominant_colors", [])[:8]:
+            st.markdown(f"**{color}** — {cnt} item{'s' if cnt > 1 else ''}")
     with c2:
         st.markdown("### 💡 Wardrobe Gaps")
-        for gap in profile.get("gaps",[]):
+        for gap in profile.get("gaps", []):
             st.markdown(f"- {gap}")
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
-p = st.session_state.page
-if   p == "home":             page_home()
-elif p == "wardrobe_builder": page_wardrobe_builder()
-elif p == "my_wardrobe":      page_my_wardrobe()
-elif p == "outfit":           page_outfit()
-elif p == "tryon":            page_tryon()
-elif p == "profile":          page_profile()
+_p = st.session_state.page
+if   _p == "home":              page_home()
+elif _p == "wardrobe_builder":  page_wardrobe_builder()
+elif _p == "my_wardrobe":       page_my_wardrobe()
+elif _p == "outfit":            page_outfit()
+elif _p == "tryon":             page_tryon()
+elif _p == "profile":           page_profile()
