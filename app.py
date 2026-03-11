@@ -684,19 +684,34 @@ def page_tryon():
             st.error("No tops or bottoms to try on in this outfit.")
         else:
             if st.button("✨ Generate Try-On", type="primary", use_container_width=True):
-                prog = st.progress(0, text="🚀 Connecting to FASHN…")
-                engine = TryOnEngine(fashn_key)
-                result = engine.run_outfit(
-                    person=st.session_state.person_photo,
-                    items=tryable,
-                    progress=lambda p, m: prog.progress(p, text=m),
-                )
-                if result["success"] and result["result_image"]:
+                prog_bar = st.progress(0)
+                prog_text = st.empty()
+
+                def update_progress(pct, msg):
+                    try:
+                        prog_bar.progress(min(int(pct), 100))
+                        prog_text.markdown(f"_{msg}_")
+                    except Exception:
+                        pass
+
+                update_progress(5, "🚀 Connecting to FASHN…")
+                try:
+                    engine = TryOnEngine(fashn_key)
+                    result = engine.run_outfit(
+                        person=st.session_state.person_photo,
+                        items=tryable,
+                        progress=update_progress,
+                    )
+                except Exception as _te:
+                    st.error(f"Try-on error: {_te}")
+                    result = {"success": False, "error": str(_te)}
+
+                if result.get("success") and result.get("result_image"):
                     st.session_state.tryon_results[result_key] = result["result_image"]
                     st.rerun()
                 else:
-                    st.error(f"Try-on failed: {result.get('error','Unknown')}")
-                    st.caption("Check your credits at app.fashn.ai/api")
+                    st.error(f"Try-on failed: {result.get('error','Unknown error')}")
+                    st.caption("Check your FASHN credits at app.fashn.ai")
 
     if outfit.get("ai_explanation"):
         st.markdown(
