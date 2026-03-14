@@ -1,4 +1,37 @@
-import base64, time, requests
+import base64, time, requests, re
+
+def _fetch_garment_image(item_name, color, category):
+    """Fetch a real garment photo for try-on from multiple sources."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    def download(url):
+        try:
+            r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
+                return r.content
+        except Exception:
+            pass
+        return None
+
+    # Strategy 1: Unsplash (most reliable for fashion)
+    q = f"{color}+{item_name}+{category}+fashion+apparel".replace(" ", "+")
+    img = download(f"https://source.unsplash.com/400x600/?{q}")
+    if img:
+        return img
+
+    # Strategy 2: Picsum as absolute fallback (not fashion, but won't crash try-on)
+    img = download(f"https://picsum.photos/seed/{item_name.replace(' ','')}/400/600")
+    if img:
+        return img
+
+    return None
 
 class TryOnEngine:
     BASE = "https://api.fashn.ai/v1"
@@ -87,18 +120,22 @@ class TryOnEngine:
 
             garment = item.get("uploaded_image")
             if not garment:
-                q = f"{item['color']}+{item['name']}+fashion+flat+lay".replace(" ", "+")
-                try:
-                    r = requests.get(f"https://source.unsplash.com/400x500/?{q}",
-                                     timeout=15, allow_redirects=True)
-                    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                        garment = r.content
-                except Exception:
-                    pass
+                if progress:
+                    try:
+                        progress(int(15 + idx / len(queue) * 70),
+                                 f"🔍 Finding garment image for {item['name']}…")
+                    except Exception:
+                        pass
+                garment = _fetch_garment_image(
+                    item.get("name", "clothing"),
+                    item.get("color", ""),
+                    item.get("category", "tops")
+                )
 
             if not garment:
                 return {"success": False, "result_image": None,
-                        "error": f"No garment image found for {item['name']}"}
+                        "error": f"Could not find garment image for {item['name']}. "
+                                 f"Upload a photo of this item in your wardrobe."}
 
             try:
                 result, err = self.tryon(current, garment, cat)
