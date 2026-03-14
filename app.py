@@ -61,6 +61,7 @@ def fetch_product_image(item_name, color, category, api_key=None):
     return None
 
 
+def _parse_claude_json(text):
     text = text.strip()
     if "```" in text:
         for part in text.split("```"):
