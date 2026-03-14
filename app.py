@@ -25,81 +25,35 @@ except ImportError:
 
 def fetch_product_image(item_name, color, category):
     """
-    Fetch a real product photo. Tries multiple sources in order.
-    Returns image bytes or None.
+    Generate a real clothing product image using Pollinations.ai (free, no API key).
+    URL format: https://image.pollinations.ai/prompt/{prompt}&width=400&height=500&model=flux
     """
-    import requests, re
+    import requests
+    from urllib.parse import quote
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+    # Craft a detailed prompt for a clean product shot
+    prompt = (
+        f"{color} {item_name}, fashion product photo, "
+        f"flat lay on white background, studio lighting, "
+        f"high quality clothing photography, no people"
+    )
+    encoded = quote(prompt)
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?width=400&height=500&model=flux&nologo=true&enhance=true"
+    )
 
-    def download(url):
-        try:
-            r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-            ct = r.headers.get("content-type", "")
-            if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
-                return r.content
-        except Exception:
-            pass
-        return None
-
-    query = f"{color} {item_name} clothing fashion"
-
-    # Strategy 1: DuckDuckGo image search (more reliable than Bing scrape)
     try:
-        ddg_url = (
-            "https://duckduckgo.com/i.js?q="
-            + query.replace(" ", "+")
-            + "&o=json&ia=images"
-        )
-        resp = requests.get(ddg_url, headers=headers, timeout=10)
-        data = resp.json()
-        results = data.get("results", [])
-        for hit in results[:5]:
-            img_url = hit.get("image") or hit.get("thumbnail")
-            if img_url:
-                img = download(img_url)
-                if img:
-                    return img
-    except Exception:
-        pass
-
-    # Strategy 2: Pixabay free image API (no key needed for basic use)
-    try:
-        pq = query.replace(" ", "+")
-        purl = f"https://pixabay.com/api/?key=&q={pq}&image_type=photo&category=fashion&per_page=5"
-        resp = requests.get(purl, timeout=10)
-        hits = resp.json().get("hits", [])
-        for h in hits[:3]:
-            img = download(h.get("webformatURL",""))
-            if img:
-                return img
-    except Exception:
-        pass
-
-    # Strategy 3: Unsplash source (reliable redirect-based)
-    try:
-        q = f"{color}+{item_name}+{category}+apparel".replace(" ", "+")
-        img = download(f"https://source.unsplash.com/400x600/?{q}")
-        if img:
-            return img
-    except Exception:
-        pass
-
-    # Strategy 4: Picsum as last resort (generic placeholder)
-    try:
-        img = download("https://picsum.photos/seed/" + item_name.replace(" ","") + "/400/600")
-        if img:
-            return img
+        r = requests.get(url, timeout=30)
+        ct = r.headers.get("content-type", "")
+        if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
+            return r.content
     except Exception:
         pass
 
     return None
+
+
 
 
 def _parse_claude_json(text):
