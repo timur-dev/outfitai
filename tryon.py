@@ -1,36 +1,24 @@
 import base64, time, requests, re
 
 def _fetch_garment_image(item_name, color, category):
-    """Fetch a real garment photo for try-on from multiple sources."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
-    def download(url):
-        try:
-            r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-            ct = r.headers.get("content-type", "")
-            if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
-                return r.content
-        except Exception:
-            pass
-        return None
-
-    # Strategy 1: Unsplash (most reliable for fashion)
-    q = f"{color}+{item_name}+{category}+fashion+apparel".replace(" ", "+")
-    img = download(f"https://source.unsplash.com/400x600/?{q}")
-    if img:
-        return img
-
-    # Strategy 2: Picsum as absolute fallback (not fashion, but won't crash try-on)
-    img = download(f"https://picsum.photos/seed/{item_name.replace(' ','')}/400/600")
-    if img:
-        return img
-
+    """Generate a clean garment image via Pollinations.ai for FASHN try-on."""
+    from urllib.parse import quote
+    prompt = (
+        f"{color} {item_name}, fashion product photo, "
+        f"flat lay on white background, studio lighting, "
+        f"clothing only, no people, high quality"
+    )
+    url = (
+        f"https://image.pollinations.ai/prompt/{quote(prompt)}"
+        f"?width=400&height=500&model=flux&nologo=true&enhance=true"
+    )
+    try:
+        r = requests.get(url, timeout=30)
+        ct = r.headers.get("content-type", "")
+        if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
+            return r.content
+    except Exception:
+        pass
     return None
 
 class TryOnEngine:
