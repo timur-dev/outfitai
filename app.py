@@ -23,37 +23,42 @@ except ImportError:
     ANTHROPIC_OK = False
 
 
-def fetch_product_image(item_name, color, category):
+def fetch_product_image(item_name, color, category, api_key=None):
     """
-    Generate a real clothing product image using Pollinations.ai (free, no API key).
-    URL format: https://image.pollinations.ai/prompt/{prompt}&width=400&height=500&model=flux
+    Fetch a real product photo for a clothing item.
+    Strategy: Bing image search scrape → Unsplash fallback → Claude generation fallback.
+    Returns image bytes or None.
     """
-    import requests
-    from urllib.parse import quote
+    import requests, re
 
-    # Craft a detailed prompt for a clean product shot
-    prompt = (
-        f"{color} {item_name}, fashion product photo, "
-        f"flat lay on white background, studio lighting, "
-        f"high quality clothing photography, no people"
-    )
-    encoded = quote(prompt)
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=400&height=500&model=flux&nologo=true&enhance=true"
-    )
+    query = f"{color} {item_name} fashion product photo white background"
+    encoded = query.replace(" ", "+")
 
+    # Strategy 1: Bing image search (no API key needed)
     try:
-        r = requests.get(url, timeout=30)
-        ct = r.headers.get("content-type", "")
-        if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        url = f"https://www.bing.com/images/search?q={encoded}&form=HDRSC2&first=1"
+        resp = requests.get(url, headers=headers, timeout=10)
+        # Extract first image URL from murl pattern
+        matches = re.findall(r'"murl":"(https?://[^"]+?\.(?:jpg|jpeg|png))"', resp.text)
+        if matches:
+            img = requests.get(matches[0], timeout=10, headers=headers)
+            if img.status_code == 200 and "image" in img.headers.get("content-type",""):
+                return img.content
+    except Exception:
+        pass
+
+    # Strategy 2: Unsplash
+    try:
+        q = f"{color}+{item_name}+{category}+fashion".replace(" ", "+")
+        r = requests.get(f"https://source.unsplash.com/400x500/?{q}",
+                        timeout=10, allow_redirects=True)
+        if r.status_code == 200 and "image" in r.headers.get("content-type",""):
             return r.content
     except Exception:
         pass
 
     return None
-
-
 
 
 def _parse_claude_json(text):
@@ -291,28 +296,13 @@ def page_wardrobe_builder():
             st.progress(idx / total, text=f"Card {idx+1} of {total} — {item['category']}")
             _, cc, _ = st.columns([1, 2, 1])
             with cc:
-                # Show real product image if already fetched, else fetch now
-                img_cache_key = f"catalog_img_{item['id']}"
-                if img_cache_key not in st.session_state:
-                    with st.spinner("Loading product image…"):
-                        img = fetch_product_image(item["name"], item["colors"][0], item["category"])
-                        st.session_state[img_cache_key] = img
-
-                cached_img = st.session_state.get(img_cache_key)
-                if cached_img:
-                    st.image(cached_img, width='stretch')
-                else:
-                    st.markdown(
-                        f'<div class="swipe-card">'
-                        f'<div style="font-size:5rem">{item["emoji"]}</div>'
-                        f'</div>', unsafe_allow_html=True)
-
                 st.markdown(
-                    f'<div style="text-align:center;padding:12px 0">'
-                    f'<div style="font-size:1.3rem;font-weight:700;color:#e9d5ff">'
+                    f'<div class="swipe-card">'
+                    f'<div style="font-size:5rem">{item["emoji"]}</div>'
+                    f'<div style="font-size:1.4rem;font-weight:700;color:#e9d5ff">'
                     f'{item["name"]}</div>'
-                    f'<div style="color:#9ca3af;font-size:0.9rem;margin:4px 0">'
-                    f'{item["description"]}</div>'
+                    f'<div style="color:#9ca3af;font-size:0.9rem">'
+                    f'{item["description"]}</div><br>'
                     f'{"".join(f"<span class=tag>{s}</span>" for s in item["styles"])}'
                     f'</div>', unsafe_allow_html=True)
 
@@ -325,7 +315,6 @@ def page_wardrobe_builder():
                              use_container_width=True, key=f"add_sw_{idx}"):
                     colors = picked if picked else [item["colors"][0]]
                     existing = {w["id"] for w in st.session_state.wardrobe}
-                    added_names = []
                     for color in colors:
                         witem = {
                             "id": f"{item['id']}_{color}",
@@ -333,18 +322,13 @@ def page_wardrobe_builder():
                             "color": color, "emoji": item["emoji"],
                             "styles": item["styles"], "occasions": item["occasions"],
                             "formality": item["formality"],
-                            "source": "swipe",
-                            # Store the real product image we already fetched
-                            "uploaded_image": st.session_state.get(img_cache_key),
+                            "source": "swipe", "uploaded_image": None,
                         }
                         if witem["id"] not in existing:
                             st.session_state.wardrobe.append(witem)
-                            added_names.append(f"{color} {item['name']}")
                     st.session_state.swipe_history.append({"item": item, "action": "own"})
                     st.session_state[f"show_colors_{idx}"] = False
                     st.session_state.swipe_index += 1
-                    if added_names:
-                        st.toast(f"✅ Added: {', '.join(added_names)}", icon="👕")
                     st.rerun()
             else:
                 b1, b2, b3 = st.columns(3)
@@ -444,8 +428,9 @@ def page_wardrobe_builder():
                     item_cols = st.columns(min(len(extracted), 3))
                     for ei, ex in enumerate(extracted):
                         with item_cols[ei % 3]:
+                            # Show real product image, not the uploaded photo
                             if ex.get("product_image"):
-                                st.image(ex["product_image"], width='stretch')
+                                st.image(ex["product_image"], use_container_width=True)
                             else:
                                 cat_emoji = {
                                     "tops": "👕", "bottoms": "👖", "dresses": "👗",
@@ -460,15 +445,12 @@ def page_wardrobe_builder():
                             st.markdown(f"**{ex['name']}**")
                             st.caption(f"{ex['color']} · {ex['category']}")
 
-                            item_id  = f"photo_{f.name}_{ei}_{ex['color']}".replace(" ","_")
-                            existing = {w["id"] for w in st.session_state.wardrobe}
-                            add_key  = f"add_ext_{f.name}_{ei}"
-
-                            if item_id in existing:
-                                st.success("✅ In wardrobe")
-                            else:
-                                if st.button("➕ Add", key=add_key,
-                                             use_container_width=True, type="primary"):
+                            add_key = f"add_ext_{f.name}_{ei}"
+                            if st.button("➕ Add to Wardrobe", key=add_key,
+                                         use_container_width=True, type="primary"):
+                                item_id = f"photo_{f.name}_{ei}_{ex['color']}".replace(" ","_")
+                                existing = {w["id"] for w in st.session_state.wardrobe}
+                                if item_id not in existing:
                                     st.session_state.wardrobe.append({
                                         "id":             item_id,
                                         "name":           ex["name"],
@@ -479,11 +461,14 @@ def page_wardrobe_builder():
                                         "occasions":      ex.get("occasions", ["casual"]),
                                         "formality":      ex.get("formality", 2),
                                         "source":         "photo_upload",
+                                        # Store the product image, NOT the full uploaded photo
                                         "uploaded_image": ex.get("product_image") or img_bytes,
                                         "original_photo": img_bytes,
                                     })
-                                    st.toast(f"✅ {ex['name']} added to wardrobe!", icon="👕")
+                                    st.success(f"✅ {ex['name']} added!")
                                     st.rerun()
+                                else:
+                                    st.info("Already in wardrobe.")
 
                     if st.button("➕ Add All Items", key=f"add_all_{f.name}",
                                  use_container_width=True):
@@ -801,7 +786,7 @@ def page_tryon():
             for j, item in enumerate(selected_items):
                 with icols[j]:
                     if item.get("uploaded_image"):
-                        st.image(item["uploaded_image"], width='stretch')
+                        st.image(item["uploaded_image"], use_container_width=True)
                     else:
                         st.markdown(
                             f'<div class="wardrobe-card">'                            f'<div style="font-size:2rem">{item["emoji"]}</div>'                            f'<div style="font-weight:600;color:#e9d5ff;font-size:0.85rem">{item["name"]}</div>'                            f'<div style="color:#9ca3af;font-size:0.75rem">{item["color"]}</div>'                            f'</div>', unsafe_allow_html=True)
@@ -850,14 +835,14 @@ def page_tryon():
     col_before, col_after = st.columns(2)
     with col_before:
         st.markdown("**📸 You**")
-        st.image(st.session_state.person_photo, width='stretch')
+        st.image(st.session_state.person_photo, use_container_width=True)
 
     cached = st.session_state.tryon_results.get(result_key)
 
     with col_after:
         st.markdown("**✨ You wearing the outfit**")
         if cached:
-            st.image(cached, width='stretch')
+            st.image(cached, use_container_width=True)
         else:
             st.markdown(
                 '<div class="outfit-card" style="text-align:center;min-height:350px;'                'display:flex;align-items:center;justify-content:center">'                '<div><div style="font-size:4rem">👗</div>'                '<div style="color:#9ca3af;margin-top:16px">Your try-on will appear here</div>'                '</div></div>', unsafe_allow_html=True)
