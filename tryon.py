@@ -1,39 +1,49 @@
-import base64, time, requests, re
+"""
+OutfitAI — FASHN Virtual Try-On
+Sends base64 images with proper validation + JPEG re-encoding.
+"""
+import base64, time, io, requests
 
-def _fetch_garment_image(item_name, color, category):
-    """Generate a clean garment image via Pollinations.ai for FASHN try-on."""
-    from urllib.parse import quote
-    prompt = (
-        f"{color} {item_name}, fashion product photo, "
-        f"flat lay on white background, studio lighting, "
-        f"clothing only, no people, high quality"
-    )
-    url = (
-        f"https://image.pollinations.ai/prompt/{quote(prompt)}"
-        f"?width=400&height=500&model=flux&nologo=true&enhance=true"
-    )
+
+def _to_jpeg_b64(img_bytes: bytes) -> str:
+    """
+    Convert any image bytes to a clean JPEG, return as base64 data URI.
+    This fixes 400 errors caused by corrupt/wrong-format images from web fetches.
+    """
     try:
-        r = requests.get(url, timeout=30)
-        ct = r.headers.get("content-type", "")
-        if r.status_code == 200 and "image" in ct and len(r.content) > 5000:
-            return r.content
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_bytes))
+        # Convert RGBA/P to RGB (JPEG doesn't support alpha)
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        # Resize if too large (FASHN works best at ~800x1200)
+        max_side = 1200
+        w, h = img.size
+        if max(w, h) > max_side:
+            scale = max_side / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return f"data:image/jpeg;base64,{b64}"
     except Exception:
-        pass
-    return None
+        # PIL not available or image broken — send as-is
+        b64 = base64.b64encode(img_bytes).decode()
+        return f"data:image/jpeg;base64,{b64}"
+
 
 class TryOnEngine:
     BASE = "https://api.fashn.ai/v1"
 
-    def __init__(self, api_key):
+    def __init__(self, api_key: str):
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
-    def _b64(self, img):
-        return "data:image/jpeg;base64," + base64.b64encode(img).decode()
-
-    def _download(self, url):
+    def _download(self, url: str):
         try:
             r = requests.get(url, timeout=30)
             r.raise_for_status()
@@ -41,27 +51,34 @@ class TryOnEngine:
         except Exception:
             return None
 
-    def tryon(self, person, garment, category="auto"):
+    def tryon(self, person: bytes, garment: bytes, category="auto"):
+        """
+        Submit try-on job and poll until complete.
+        Returns (result_bytes, error_string).
+        """
         payload = {
             "model_name": "tryon-v1.6",
             "inputs": {
-                "model_image":   self._b64(person),
-                "garment_image": self._b64(garment),
+                "model_image":   _to_jpeg_b64(person),
+                "garment_image": _to_jpeg_b64(garment),
                 "category":      category,
+                "mode":          "balanced",
             }
         }
         try:
             r = requests.post(f"{self.BASE}/run", json=payload,
-                              headers=self.headers, timeout=30)
-            r.raise_for_status()
+                              headers=self.headers, timeout=60)
+            if not r.ok:
+                return None, f"FASHN /run failed: {r.status_code} — {r.text[:300]}"
             job = r.json()
         except Exception as e:
-            return None, f"FASHN /run failed: {e}"
+            return None, f"FASHN /run error: {e}"
 
         pid = job.get("id")
         if not pid:
-            return None, f"No prediction ID: {job}"
+            return None, f"No prediction ID returned: {job}"
 
+        # Poll up to 120s
         for _ in range(40):
             time.sleep(3)
             try:
@@ -76,22 +93,28 @@ class TryOnEngine:
                 data = self._download(url)
                 return (data, None) if data else (None, "Download failed")
             if status in ("failed", "cancelled", "time_out"):
-                return None, f"FASHN job {status}: {s.get('error','')}"
+                err = s.get("error", {})
+                return None, f"FASHN job {status}: {err}"
 
         return None, "Timeout after 120s"
 
-    def run_outfit(self, person, items, progress=None):
+    def run_outfit(self, person: bytes, items: list, progress=None) -> dict:
+        """
+        Chain try-ons: upper_body first, then lower_body.
+        Each item needs: category, name, color, uploaded_image (bytes or None).
+        """
         import traceback as _tb
+
         tops    = [i for i in items if i["category"] == "tops"]
         dresses = [i for i in items if i["category"] == "dresses"]
         bottoms = [i for i in items if i["category"] == "bottoms"]
 
         queue = []
         if dresses:
-            queue.append(("full_body",   dresses[0]))
+            queue.append(("one-pieces", dresses[0]))
         else:
-            if tops:    queue.append(("upper_body", tops[0]))
-            if bottoms: queue.append(("lower_body", bottoms[0]))
+            if tops:    queue.append(("tops",    tops[0]))
+            if bottoms: queue.append(("bottoms", bottoms[0]))
 
         if not queue:
             return {"success": False, "result_image": None,
@@ -106,19 +129,15 @@ class TryOnEngine:
                 except Exception:
                     pass
 
+            # Get garment image — prefer uploaded_image, then fetch
             garment = item.get("uploaded_image")
             if not garment:
-                if progress:
-                    try:
-                        progress(int(15 + idx / len(queue) * 70),
-                                 f"🔍 Finding garment image for {item['name']}…")
-                    except Exception:
-                        pass
-                garment = _fetch_garment_image(
-                    item.get("name", "clothing"),
-                    item.get("color", ""),
-                    item.get("category", "tops")
-                )
+                try:
+                    from garments import get_garment_image
+                    garment = get_garment_image(
+                        item.get("name", ""), item.get("color", ""), cat)
+                except Exception:
+                    pass
 
             if not garment:
                 return {"success": False, "result_image": None,
@@ -129,7 +148,7 @@ class TryOnEngine:
                 result, err = self.tryon(current, garment, cat)
             except Exception as e:
                 return {"success": False, "result_image": None,
-                        "error": f"tryon() raised: {e}\n{_tb.format_exc()}"}
+                        "error": f"tryon() error: {e}\n{_tb.format_exc()}"}
 
             if result:
                 current = result
@@ -141,39 +160,4 @@ class TryOnEngine:
                 progress(100, "✅ Done!")
             except Exception:
                 pass
-        return {"success": True, "result_image": current, "error": None}
-
-        if not queue:
-            return {"success": False, "result_image": None,
-                    "error": "No tops/bottoms/dresses in outfit"}
-
-        current = person
-        for idx, (cat, item) in enumerate(queue):
-            if progress:
-                progress(int(15 + idx / len(queue) * 70),
-                         f"👗 Trying on {item['color']} {item['name']}…")
-
-            garment = item.get("uploaded_image")
-            if not garment:
-                q = f"{item['color']}+{item['name']}+fashion+flat+lay".replace(" ", "+")
-                try:
-                    r = requests.get(f"https://source.unsplash.com/400x500/?{q}",
-                                     timeout=15, allow_redirects=True)
-                    if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                        garment = r.content
-                except Exception:
-                    pass
-
-            if not garment:
-                return {"success": False, "result_image": None,
-                        "error": f"No garment image for {item['name']}"}
-
-            result, err = self.tryon(current, garment, cat)
-            if result:
-                current = result
-            else:
-                return {"success": False, "result_image": None, "error": err}
-
-        if progress:
-            progress(100, "✅ Done!")
         return {"success": True, "result_image": current, "error": None}
