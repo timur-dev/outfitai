@@ -20,7 +20,8 @@ except ImportError:
 
 from visuals import (
     item_svg_html, shape_for, clothing_svg, resolve_color,
-    start_fetch, get_product_image, is_fetching, fetch_status
+    start_fetch, get_product_image, get_candidates_cached,
+    confirm_image, is_fetching, fetch_status
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,12 +83,14 @@ def show_item_visual(item, width=100):
             st.caption("⏳ loading…")
 
 
-def add_to_wardrobe(item):
-    """Add item and immediately kick off background image fetch."""
+def add_to_wardrobe(item, ask_confirm=True):
+    """Add item, kick off background fetch, queue for confirmation."""
     existing = {w["id"] for w in st.session_state.wardrobe}
     if item["id"] not in existing:
         st.session_state.wardrobe.append(item)
-        start_fetch(item)   # ← parallel fetch starts NOW
+        start_fetch(item)
+        if ask_confirm:
+            st.session_state.pending_confirm = item["id"]
         return True
     return False
 
@@ -133,7 +136,7 @@ st.markdown("""
 DEFAULTS = {
     "wardrobe":[], "page":"home", "occasion":"casual", "city":"New York",
     "outfit_suggestions":[], "person_photo":None, "tryon_results":{},
-    "tryon_outfit_index":0, "wardrobe_cat_filter":"All",
+    "tryon_outfit_index":0, "wardrobe_cat_filter":"All", "pending_confirm":None,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -375,6 +378,76 @@ def page_wardrobe_builder():
                         if st.button("+ Add", key=f"cat_{item['id']}",
                                      use_container_width=True):
                             add_to_wardrobe(item)
+                            st.rerun()
+
+        # ── CONFIRMATION DIALOG ───────────────────────────────────────────────
+        confirm_id = st.session_state.get("pending_confirm")
+        if confirm_id:
+            # Find the item
+            item_obj = next((w for w in st.session_state.wardrobe
+                             if w["id"] == confirm_id), None)
+            if item_obj:
+                st.markdown("---")
+                st.markdown("### 🔍 Is this the right photo?")
+                st.caption(f"Showing results for **{item_obj['color']} {item_obj['name']}** — "
+                           f"confirm or pick a better match.")
+
+                status = fetch_status(confirm_id)
+                if status == "loading":
+                    st.info("⏳ Fetching photos… please wait a moment then refresh.")
+                else:
+                    candidates = get_candidates_cached(confirm_id)
+                    if not candidates:
+                        st.warning("No photos found. You can upload your own below.")
+                        candidates = []
+
+                    # Show up to 4 candidates in a row
+                    if candidates:
+                        cand_cols = st.columns(min(len(candidates), 4))
+                        for ci, cand in enumerate(candidates):
+                            with cand_cols[ci]:
+                                st.image(cand, use_container_width=True)
+                                if st.button(f"✓ This one", key=f"pick_{confirm_id}_{ci}",
+                                             type="primary", use_container_width=True):
+                                    confirm_image(confirm_id, cand)
+                                    st.session_state.pending_confirm = None
+                                    st.success(f"✅ {item_obj['name']} confirmed!")
+                                    st.rerun()
+
+                    # Upload own photo option
+                    st.markdown("**None match? Upload your own:**")
+                    own_photo = st.file_uploader(
+                        "Upload photo of this item",
+                        type=["jpg","jpeg","png"],
+                        key=f"own_{confirm_id}"
+                    )
+                    if own_photo:
+                        img_bytes = own_photo.read()
+                        confirm_image(confirm_id, img_bytes)
+                        # Also set uploaded_image on the wardrobe item
+                        for w in st.session_state.wardrobe:
+                            if w["id"] == confirm_id:
+                                w["uploaded_image"] = img_bytes
+                                break
+                        st.session_state.pending_confirm = None
+                        st.success(f"✅ {item_obj['name']} photo saved!")
+                        st.rerun()
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("🔄 Search Again", key=f"retry_{confirm_id}",
+                                     use_container_width=True):
+                            # Clear cache and re-fetch
+                            from visuals import _fetch_lock, _candidates_cache, _confirmed_cache
+                            with _fetch_lock:
+                                _candidates_cache.pop(confirm_id, None)
+                                _confirmed_cache.pop(confirm_id, None)
+                            start_fetch(item_obj)
+                            st.rerun()
+                    with c2:
+                        if st.button("Skip — use SVG silhouette", key=f"skip_{confirm_id}",
+                                     type="secondary", use_container_width=True):
+                            st.session_state.pending_confirm = None
                             st.rerun()
 
         st.markdown("---")
