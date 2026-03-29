@@ -292,91 +292,34 @@ def item_svg_html(item: dict, size: int = 72) -> str:
 
 # ── Parallel product image fetcher ────────────────────────────────────────────
 
-_fetch_lock  = threading.Lock()
-_fetch_cache: dict[str, bytes | None] = {}   # item_id → bytes or None
-_fetch_jobs:  set[str]                = set() # currently fetching
+_fetch_lock      = threading.Lock()
+_candidates_cache = {}   # item_id → list[bytes]  (multiple options)
+_confirmed_cache  = {}   # item_id → bytes         (user-confirmed image)
+_fetch_jobs       = set()
 
 
-def _do_fetch(item_id: str, name: str, color: str, category: str) -> None:
-    """Background thread: uses garments.py DB first, then web search fallback."""
+def _do_fetch(item_id, name, color, category):
+    """Background thread: fetch multiple candidates, store all."""
     try:
-        from garments import get_garment_image
-        result = get_garment_image(name, color, category)
+        from garments import get_candidates
+        results = get_candidates(name, color, category, max_candidates=4)
     except Exception:
-        result = None
+        results = []
 
     with _fetch_lock:
-        _fetch_cache[item_id] = result
+        _candidates_cache[item_id] = results
+        # Auto-select first as default (user can change)
+        if results and item_id not in _confirmed_cache:
+            _confirmed_cache[item_id] = results[0]
         _fetch_jobs.discard(item_id)
 
 
-def _do_fetch_OLD(item_id: str, name: str, color: str, category: str) -> None:
-    """Background thread: fetch best product image, store in cache."""
-    queries = [
-        f"{color} {name} fashion product photo flat lay white background",
-        f"{color} {name} clothing apparel",
-        f"{name} {category} fashion",
-    ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    result = None
-    for query in queries:
-        encoded = query.replace(" ", "+")
-        try:
-            url  = f"https://www.bing.com/images/search?q={encoded}&form=HDRSC2&first=1"
-            resp = requests.get(url, headers=headers, timeout=8)
-            # murl = full-resolution image URLs embedded in the page
-            urls = re.findall(
-                r'"murl":"(https?://[^"]+?\.(?:jpg|jpeg|png))"',
-                resp.text
-            )
-            for img_url in urls[:3]:  # try first 3 results
-                try:
-                    img = requests.get(img_url, headers=headers, timeout=8)
-                    ct  = img.headers.get("content-type", "")
-                    if img.status_code == 200 and "image" in ct and len(img.content) > 5000:
-                        result = img.content
-                        break
-                except Exception:
-                    continue
-            if result:
-                break
-        except Exception:
-            continue
-
-    # Fallback: Unsplash
-    if not result:
-        try:
-            q = f"{color}+{name}+fashion+clothing".replace(" ", "+")
-            r = requests.get(
-                f"https://source.unsplash.com/400x500/?{q}",
-                headers=headers, timeout=8, allow_redirects=True
-            )
-            if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                result = r.content
-        except Exception:
-            pass
-
-    with _fetch_lock:
-        _fetch_cache[item_id] = result   # None if both failed
-        _fetch_jobs.discard(item_id)
-
-
-def start_fetch(item: dict) -> None:
-    """
-    Kick off a background fetch for this item's product image.
-    Call this immediately when the user adds an item.
-    Safe to call multiple times — idempotent.
-    """
+def start_fetch(item):
+    """Kick off background fetch. Safe to call multiple times."""
     item_id = item.get("id", "")
     with _fetch_lock:
-        if item_id in _fetch_cache or item_id in _fetch_jobs:
-            return   # already done or in-flight
+        if item_id in _candidates_cache or item_id in _fetch_jobs:
+            return
         _fetch_jobs.add(item_id)
 
     t = threading.Thread(
@@ -387,25 +330,32 @@ def start_fetch(item: dict) -> None:
     t.start()
 
 
-def get_product_image(item_id: str) -> bytes | None:
-    """
-    Return fetched image bytes, or None if still loading / not found.
-    Check is_fetching() first to show a spinner.
-    """
+def get_product_image(item_id):
+    """Return confirmed image bytes, or None."""
     with _fetch_lock:
-        return _fetch_cache.get(item_id)
+        return _confirmed_cache.get(item_id)
 
 
-def is_fetching(item_id: str) -> bool:
-    """True while background fetch is still in progress."""
+def get_candidates_cached(item_id):
+    """Return all fetched candidate images for this item."""
+    with _fetch_lock:
+        return _candidates_cache.get(item_id, [])
+
+
+def confirm_image(item_id, image_bytes):
+    """User confirmed this image — store as the canonical one."""
+    with _fetch_lock:
+        _confirmed_cache[item_id] = image_bytes
+
+
+def is_fetching(item_id):
     with _fetch_lock:
         return item_id in _fetch_jobs
 
 
-def fetch_status(item_id: str) -> str:
-    """'done' | 'loading' | 'pending'"""
+def fetch_status(item_id):
     with _fetch_lock:
-        if item_id in _fetch_cache:
+        if item_id in _candidates_cache:
             return "done"
         if item_id in _fetch_jobs:
             return "loading"
