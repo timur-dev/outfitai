@@ -65,11 +65,35 @@ def extract_clothing_from_photo(image_bytes, api_key):
 
 
 def best_image(item):
-    """Return image bytes: fetched product photo → original upload → None."""
-    fetched = get_product_image(item.get("id",""))
+    """
+    Return image bytes: confirmed photo → uploaded → sync fetch if nothing.
+    Writes result back onto item dict so it survives reruns.
+    """
+    item_id = item.get("id","")
+
+    # 1. Already confirmed / fetched in memory
+    fetched = get_product_image(item_id)
     if fetched:
         return fetched
-    return item.get("original_photo") or item.get("uploaded_image")
+
+    # 2. Already written on item dict (survives reruns)
+    stored = item.get("uploaded_image") or item.get("original_photo")
+    if stored:
+        return stored
+
+    # 3. Sync fetch as last resort (blocking but reliable)
+    if item_id and fetch_status(item_id) == "pending":
+        try:
+            from garments import get_garment_image
+            img = get_garment_image(
+                item.get("name",""), item.get("color",""), item.get("category",""))
+            if img:
+                write_confirmed_image_to_item(item_id, img)
+                return img
+        except Exception:
+            pass
+
+    return None
 
 
 def show_item_visual(item, width=100):
@@ -93,6 +117,19 @@ def add_to_wardrobe(item, ask_confirm=True):
             st.session_state.pending_confirm = item["id"]
         return True
     return False
+
+
+def write_confirmed_image_to_item(item_id, image_bytes):
+    """
+    Write confirmed image directly onto the wardrobe item dict so it
+    survives Streamlit reruns (thread cache doesn't persist across reruns).
+    Also updates visuals cache.
+    """
+    confirm_image(item_id, image_bytes)
+    for w in st.session_state.wardrobe:
+        if w["id"] == item_id:
+            w["uploaded_image"] = image_bytes
+            break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,7 +446,7 @@ def page_wardrobe_builder():
                                 st.image(cand, use_container_width=True)
                                 if st.button(f"✓ This one", key=f"pick_{confirm_id}_{ci}",
                                              type="primary", use_container_width=True):
-                                    confirm_image(confirm_id, cand)
+                                    write_confirmed_image_to_item(confirm_id, cand)
                                     st.session_state.pending_confirm = None
                                     st.success(f"✅ {item_obj['name']} confirmed!")
                                     st.rerun()
@@ -423,12 +460,7 @@ def page_wardrobe_builder():
                     )
                     if own_photo:
                         img_bytes = own_photo.read()
-                        confirm_image(confirm_id, img_bytes)
-                        # Also set uploaded_image on the wardrobe item
-                        for w in st.session_state.wardrobe:
-                            if w["id"] == confirm_id:
-                                w["uploaded_image"] = img_bytes
-                                break
+                        write_confirmed_image_to_item(confirm_id, img_bytes)
                         st.session_state.pending_confirm = None
                         st.success(f"✅ {item_obj['name']} photo saved!")
                         st.rerun()
@@ -852,42 +884,42 @@ def page_tryon():
             st.session_state.page = "outfit"; st.rerun()
     else:
         if st.button("🚀 Try On Now", type="primary", use_container_width=True):
-            # Ensure all garment images are ready before sending to FASHN
-            missing = [it for it in selected_items if not best_image(it)]
-            if missing:
-                with st.spinner(f"Fetching garment images for {len(missing)} item(s)…"):
-                    from garments import get_garment_image
-                    for it in missing:
-                        img_bytes = get_garment_image(
-                            it.get("name",""), it.get("color",""), it.get("category",""))
-                        if img_bytes:
-                            it["uploaded_image"] = img_bytes
-
-            still_missing = [it for it in selected_items if not best_image(it)]
-            if still_missing:
-                names = ", ".join(it["name"] for it in still_missing)
-                st.error(f"Could not find garment images for: {names}. "
-                         f"Please upload a photo of these items in the wardrobe builder.")
-                return
-
             prog_bar  = st.progress(0)
             prog_text = st.empty()
 
             def upd(pct, msg):
                 try:
-                    prog_bar.progress(min(int(pct),100))
+                    prog_bar.progress(min(int(pct), 100))
                     prog_text.markdown(
                         f'<div style="color:#a78bfa;text-align:center">{msg}</div>',
                         unsafe_allow_html=True)
                 except Exception:
                     pass
 
-            upd(5, "🔌 Connecting to FASHN AI…")
+            # Step 1: resolve garment images for all selected items
+            upd(5, "🔍 Preparing garment images…")
+            from garments import get_garment_image
 
-            # Ensure uploaded_image is set for FASHN
             for it in selected_items:
-                if not it.get("uploaded_image"):
-                    it["uploaded_image"] = best_image(it)
+                img = best_image(it)
+                if not img:
+                    upd(10, f"🌐 Fetching image for {it['color']} {it['name']}…")
+                    img = get_garment_image(
+                        it.get("name",""), it.get("color",""), it.get("category",""))
+                    if img:
+                        write_confirmed_image_to_item(it["id"], img)
+                # Always set uploaded_image so tryon.py can find it
+                it["uploaded_image"] = best_image(it)
+
+            # Check any still missing
+            still_missing = [it for it in selected_items if not it.get("uploaded_image")]
+            if still_missing:
+                names = ", ".join(f"{it['color']} {it['name']}" for it in still_missing)
+                st.error(f"⚠️ Could not find garment images for: **{names}**.")
+                st.info("💡 Go to **Build Wardrobe** → find this item → confirm a photo or upload your own.")
+                return
+
+            upd(15, "🔌 Connecting to FASHN AI…")
 
             try:
                 engine = TryOnEngine(fashn_key)
@@ -896,6 +928,7 @@ def page_tryon():
                     items=selected_items,
                     progress=upd,
                 )
+
             except Exception as _te:
                 st.error(f"Try-on error: {_te}")
                 result = {"success":False,"error":str(_te)}
