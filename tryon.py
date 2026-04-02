@@ -129,20 +129,22 @@ class TryOnEngine:
                 except Exception:
                     pass
 
-            # Get garment image — prefer uploaded_image, then fetch
+            # Get garment image — prefer uploaded_image, then sync fetch
             garment = item.get("uploaded_image")
             if not garment:
                 try:
                     from garments import get_garment_image
                     garment = get_garment_image(
                         item.get("name", ""), item.get("color", ""), cat)
+                    if garment:
+                        item["uploaded_image"] = garment  # cache for next time
                 except Exception:
                     pass
 
             if not garment:
                 return {"success": False, "result_image": None,
-                        "error": f"Could not find garment image for {item['name']}. "
-                                 f"Upload a photo of this item in your wardrobe."}
+                        "error": f"No image found for {item['color']} {item['name']}. "
+                                 f"Try uploading a photo of this item in the wardrobe builder."}
 
             try:
                 result, err = self.tryon(current, garment, cat)
