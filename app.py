@@ -66,32 +66,30 @@ def extract_clothing_from_photo(image_bytes, api_key):
 
 def best_image(item):
     """
-    Return image bytes. Always falls back to sync fetch so try-on never blocks.
+    Return image bytes. Generates color-accurate garment image if nothing stored.
     Writes result onto item dict so it survives Streamlit reruns.
     """
     item_id = item.get("id", "")
 
-    # 1. Already written on the item dict (survives reruns — most reliable)
+    # 1. Already written on item dict (most reliable — survives reruns)
     stored = item.get("uploaded_image") or item.get("original_photo")
     if stored:
         return stored
 
-    # 2. In-memory confirmed cache (only lives in current session run)
+    # 2. In-memory confirmed cache
     fetched = get_product_image(item_id)
     if fetched:
-        # Write back so next rerun finds it on the dict
         item["uploaded_image"] = fetched
         return fetched
 
-    # 3. Sync fetch — always try regardless of background fetch status
-    #    This is the guaranteed fallback for try-on
+    # 3. Generate color-accurate image (instant, no network needed)
     try:
         from garments import get_garment_image
         img = get_garment_image(
             item.get("name", ""), item.get("color", ""), item.get("category", ""))
         if img:
+            item["uploaded_image"] = img   # persist for next rerun
             write_confirmed_image_to_item(item_id, img)
-            item["uploaded_image"] = img  # write directly onto item
             return img
     except Exception:
         pass
@@ -899,16 +897,12 @@ def page_tryon():
                 except Exception:
                     pass
 
-            upd(5, "🔍 Preparing garment images…")
+            upd(5, "🎨 Preparing garment images…")
 
-            # Resolve images for all items — sync fetch if not already on dict
+            # Generate color-accurate images for all items (instant, no network)
             for it in selected_items:
                 if not it.get("uploaded_image"):
-                    upd(10, f"🌐 Fetching {it['color']} {it['name']}…")
-                    best_image(it)   # writes onto it["uploaded_image"] as side effect
-                # Final assignment for tryon.py
-                if not it.get("uploaded_image"):
-                    it["uploaded_image"] = None   # tryon.py will handle missing
+                    best_image(it)  # generates + writes onto it["uploaded_image"]
 
             upd(15, "🔌 Connecting to FASHN AI…")
 
