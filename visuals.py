@@ -299,7 +299,7 @@ _fetch_jobs       = set()
 
 
 def _do_fetch(item_id, name, color, category):
-    """Background thread: fetch multiple candidates, store all."""
+    """Background: generate color-accurate garment images (no network needed)."""
     try:
         from garments import get_candidates
         results = get_candidates(name, color, category, max_candidates=4)
@@ -308,7 +308,6 @@ def _do_fetch(item_id, name, color, category):
 
     with _fetch_lock:
         _candidates_cache[item_id] = results
-        # Auto-select first as default (user can change)
         if results and item_id not in _confirmed_cache:
             _confirmed_cache[item_id] = results[0]
         _fetch_jobs.discard(item_id)
