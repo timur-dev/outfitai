@@ -66,32 +66,35 @@ def extract_clothing_from_photo(image_bytes, api_key):
 
 def best_image(item):
     """
-    Return image bytes: confirmed photo → uploaded → sync fetch if nothing.
-    Writes result back onto item dict so it survives reruns.
+    Return image bytes. Always falls back to sync fetch so try-on never blocks.
+    Writes result onto item dict so it survives Streamlit reruns.
     """
-    item_id = item.get("id","")
+    item_id = item.get("id", "")
 
-    # 1. Already confirmed / fetched in memory
-    fetched = get_product_image(item_id)
-    if fetched:
-        return fetched
-
-    # 2. Already written on item dict (survives reruns)
+    # 1. Already written on the item dict (survives reruns — most reliable)
     stored = item.get("uploaded_image") or item.get("original_photo")
     if stored:
         return stored
 
-    # 3. Sync fetch as last resort (blocking but reliable)
-    if item_id and fetch_status(item_id) == "pending":
-        try:
-            from garments import get_garment_image
-            img = get_garment_image(
-                item.get("name",""), item.get("color",""), item.get("category",""))
-            if img:
-                write_confirmed_image_to_item(item_id, img)
-                return img
-        except Exception:
-            pass
+    # 2. In-memory confirmed cache (only lives in current session run)
+    fetched = get_product_image(item_id)
+    if fetched:
+        # Write back so next rerun finds it on the dict
+        item["uploaded_image"] = fetched
+        return fetched
+
+    # 3. Sync fetch — always try regardless of background fetch status
+    #    This is the guaranteed fallback for try-on
+    try:
+        from garments import get_garment_image
+        img = get_garment_image(
+            item.get("name", ""), item.get("color", ""), item.get("category", ""))
+        if img:
+            write_confirmed_image_to_item(item_id, img)
+            item["uploaded_image"] = img  # write directly onto item
+            return img
+    except Exception:
+        pass
 
     return None
 
@@ -896,28 +899,16 @@ def page_tryon():
                 except Exception:
                     pass
 
-            # Step 1: resolve garment images for all selected items
             upd(5, "🔍 Preparing garment images…")
-            from garments import get_garment_image
 
+            # Resolve images for all items — sync fetch if not already on dict
             for it in selected_items:
-                img = best_image(it)
-                if not img:
-                    upd(10, f"🌐 Fetching image for {it['color']} {it['name']}…")
-                    img = get_garment_image(
-                        it.get("name",""), it.get("color",""), it.get("category",""))
-                    if img:
-                        write_confirmed_image_to_item(it["id"], img)
-                # Always set uploaded_image so tryon.py can find it
-                it["uploaded_image"] = best_image(it)
-
-            # Check any still missing
-            still_missing = [it for it in selected_items if not it.get("uploaded_image")]
-            if still_missing:
-                names = ", ".join(f"{it['color']} {it['name']}" for it in still_missing)
-                st.error(f"⚠️ Could not find garment images for: **{names}**.")
-                st.info("💡 Go to **Build Wardrobe** → find this item → confirm a photo or upload your own.")
-                return
+                if not it.get("uploaded_image"):
+                    upd(10, f"🌐 Fetching {it['color']} {it['name']}…")
+                    best_image(it)   # writes onto it["uploaded_image"] as side effect
+                # Final assignment for tryon.py
+                if not it.get("uploaded_image"):
+                    it["uploaded_image"] = None   # tryon.py will handle missing
 
             upd(15, "🔌 Connecting to FASHN AI…")
 
