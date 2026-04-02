@@ -1,339 +1,323 @@
 """
-OutfitAI Engine
-Handles outfit scoring, color theory, and Claude API calls.
-Keys are read from Streamlit secrets first, then fall back to manual input.
+OutfitAI — engine.py
+Outfit scoring engine + Claude AI explanations.
+
+Scoring breakdown (100 pts total):
+  - Color harmony:   35 pts
+  - Occasion fit:    35 pts
+  - Formality match: 20 pts
+  - Variety bonus:   10 pts
 """
-import random
-from collections import Counter
-
+import itertools, os
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    import streamlit as st
+    def get_secret(key, fallback=None):
+        try:
+            return st.secrets.get(key, os.environ.get(key, fallback))
+        except Exception:
+            return os.environ.get(key, fallback)
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-
-def get_secret(key: str, fallback: str = "") -> str:
-    """Read from Streamlit Cloud secrets, fall back to provided value."""
-    try:
-        import streamlit as st
-        return st.secrets.get(key, fallback)
-    except Exception:
-        return fallback
+    def get_secret(key, fallback=None):
+        return os.environ.get(key, fallback)
 
 
-# ── Color Theory Data ─────────────────────────────────────────────────────────
+# ── Color theory ──────────────────────────────────────────────────────────────
 
-# Map color names to rough hue buckets (0–11 on color wheel)
+WARM   = {"red","rust","orange","coral","yellow","gold","camel","tan","brown","burgundy","maroon"}
+COOL   = {"blue","navy","teal","green","olive","purple","lavender","gray","grey","charcoal","silver","denim"}
+NEUTRAL= {"white","black","beige","cream","khaki","camel","tan","brown","gray","grey","charcoal","silver"}
+
 COLOR_WHEEL = {
-    "Red": 0, "Burgundy": 0, "Crimson": 0, "Wine": 0,
-    "Orange": 1, "Rust": 1, "Terracotta": 1, "Copper": 1,
-    "Yellow": 2, "Mustard": 2, "Gold": 2, "Amber": 2,
-    "Olive": 3, "Khaki": 3, "Lime": 3,
-    "Green": 4, "Forest Green": 4, "Sage": 4, "Mint": 4, "Emerald": 4,
-    "Teal": 5, "Cyan": 5, "Turquoise": 5,
-    "Light Blue": 6, "Sky Blue": 6, "Baby Blue": 6,
-    "Blue": 7, "Navy": 7, "Cobalt": 7, "Royal Blue": 7,
-    "Indigo": 8, "Purple": 8, "Lavender": 8, "Violet": 8,
-    "Pink": 9, "Blush": 9, "Rose": 9, "Mauve": 9,
-    "Brown": 10, "Camel": 10, "Tan": 10, "Beige": 10, "Cream": 10,
-    "Black": 11, "White": 11, "Grey": 11, "Gray": 11, "Charcoal": 11,
-    "Off-White": 11, "Ivory": 11,
+    "red":0,"rust":15,"orange":30,"gold":45,"yellow":60,
+    "olive":80,"green":120,"teal":165,"blue":210,"navy":225,
+    "purple":270,"lavender":285,"pink":330,"coral":15,
+    "burgundy":345,"maroon":345,"camel":35,"tan":35,"brown":30,
+    "beige":40,"cream":50,"khaki":45,"white":0,"black":0,
+    "gray":0,"grey":0,"charcoal":0,"silver":0,"denim":210,
 }
 
-NEUTRALS = {"Black", "White", "Grey", "Gray", "Charcoal", "Beige", "Cream", "Ivory", "Off-White", "Camel", "Tan"}
+def _hue(color):
+    return COLOR_WHEEL.get(color.lower(), 180)
+
+def _is_neutral(color):
+    return color.lower() in NEUTRAL
+
+def color_harmony_score(colors):
+    """Score 0-35 based on how well colors harmonize."""
+    if not colors or len(colors) < 2:
+        return 25
+
+    c = [x.lower() for x in colors]
+    neutrals = [x for x in c if _is_neutral(x)]
+    chromatic = [x for x in c if not _is_neutral(x)]
+
+    # All neutral = always works
+    if not chromatic:
+        return 32
+
+    # One color + neutrals = very safe
+    if len(chromatic) == 1:
+        return 35
+
+    if len(chromatic) >= 2:
+        hues = [_hue(x) for x in chromatic]
+        diffs = [abs(hues[i]-hues[j]) for i in range(len(hues))
+                 for j in range(i+1,len(hues))]
+        diffs = [min(d, 360-d) for d in diffs]
+        avg_diff = sum(diffs)/len(diffs)
+
+        # Monochromatic (same hue ±20)
+        if avg_diff <= 20:
+            return 33
+        # Analogous (close hues 20-60)
+        if avg_diff <= 60:
+            return 30
+        # Complementary (opposite ~180)
+        if 150 <= avg_diff <= 210:
+            return 28
+        # Triadic (~120 apart)
+        if 100 <= avg_diff <= 140:
+            return 22
+        # Clash (random)
+        return 10
+
+    return 20
 
 COLOR_RULES = {
-    "Monochromatic":    "Same hue family in different shades — clean and sophisticated",
-    "Analogous":        "3 adjacent colors on the wheel — harmonious and natural",
-    "Complementary":    "Opposite colors — bold but balanced with a neutral anchor",
-    "Neutral Base":     "All neutrals — timeless, always works",
-    "Neutral + Pop":    "Neutral base with one pop of color — effortlessly stylish",
-    "Triadic":          "Three evenly spaced colors — vibrant, needs careful balancing",
+    (35,35): "Perfect monochromatic",
+    (35,30): "Analogous harmony",
+    (35,28): "Classic complementary",
+    (35,22): "Triadic balance",
+    (32,32): "Clean neutrals",
 }
 
-# Occasion formality requirements
+def get_color_rule(score):
+    if score >= 33: return "Monochromatic / tonal"
+    if score >= 30: return "Analogous harmony"
+    if score >= 28: return "Complementary"
+    if score >= 22: return "Triadic"
+    if score >= 18: return "Neutral base"
+    return "Bold contrast"
+
+
+# ── Occasion + formality ──────────────────────────────────────────────────────
+
 OCCASION_FORMALITY = {
-    "casual":  (1, 3),
-    "work":    (2, 4),
-    "date":    (2, 4),
-    "formal":  (4, 5),
-    "active":  (1, 2),
-    "travel":  (1, 3),
+    "casual": 1.5, "active": 1, "travel": 2,
+    "work": 3.5,   "date": 3,   "formal": 4.5,
 }
 
-# Style archetypes
-ARCHETYPES = [
-    {"name": "Urban Minimalist",  "emoji": "🖤", "tags": ["minimal", "monochrome", "clean"],
-     "description": "You prefer clean lines, neutral tones, and quality over quantity. Less is always more."},
-    {"name": "Casual Cool",       "emoji": "😎", "tags": ["casual", "relaxed", "sporty"],
-     "description": "Effortlessly stylish — you look great without trying too hard. Comfort meets cool."},
-    {"name": "Classic Professional", "emoji": "👔", "tags": ["formal", "classic", "tailored"],
-     "description": "Polished and put-together. You dress for the job you want and it shows."},
-    {"name": "Boho Chic",         "emoji": "🌸", "tags": ["bohemian", "earthy", "layered"],
-     "description": "Free-spirited and eclectic. You mix textures, prints, and earthy tones with ease."},
-    {"name": "Streetwear Edge",   "emoji": "🔥", "tags": ["street", "bold", "graphic"],
-     "description": "You wear attitude. Sneakers, oversized fits, and bold statements are your language."},
-    {"name": "Smart Casual",      "emoji": "✨", "tags": ["versatile", "smart", "classic"],
-     "description": "The perfect balance — never overdressed, never underdressed. Always appropriate."},
-]
+def occasion_score(items, occasion):
+    """Score 0-35: how well items suit the occasion."""
+    if not items:
+        return 0
+    total = 0
+    for item in items:
+        occ = item.get("occasions", [])
+        if occasion in occ:
+            total += 35
+        elif any(o in occ for o in _adjacent_occasions(occasion)):
+            total += 22
+        else:
+            total += 8
+    return int(total / len(items))
 
+def _adjacent_occasions(occ):
+    adj = {
+        "casual":  ["travel","active"],
+        "active":  ["casual"],
+        "work":    ["formal","date"],
+        "date":    ["casual","work","formal"],
+        "formal":  ["work","date"],
+        "travel":  ["casual","active"],
+    }
+    return adj.get(occ, [])
+
+def formality_score(items, occasion):
+    """Score 0-20: formality of items matches occasion expectation."""
+    if not items:
+        return 10
+    target = OCCASION_FORMALITY.get(occasion, 2.5)
+    avg_formality = sum(i.get("formality", 2) for i in items) / len(items)
+    diff = abs(avg_formality - target)
+    if diff <= 0.5:   return 20
+    if diff <= 1.0:   return 16
+    if diff <= 1.5:   return 12
+    if diff <= 2.0:   return 7
+    return 3
+
+def variety_bonus(items):
+    """Score 0-10: reward style variety."""
+    styles = set()
+    for item in items:
+        styles.update(item.get("styles", []))
+    return min(10, len(styles) * 2)
+
+
+# ── Main engine ───────────────────────────────────────────────────────────────
 
 class OutfitEngine:
     def __init__(self, wardrobe, occasion="casual", city="New York", api_key=None):
-        self.wardrobe = wardrobe
-        self.occasion = occasion
-        self.city = city
-        # Auto-load from Streamlit secrets if not passed manually
-        self.api_key = api_key or get_secret("ANTHROPIC_API_KEY")
+        self.wardrobe  = wardrobe
+        self.occasion  = occasion
+        self.city      = city
+        self.api_key   = api_key or get_secret("ANTHROPIC_API_KEY")
 
-    # ── Wardrobe grouping ────────────────────────────────────────────────────
-    def _group_by_category(self):
-        groups = {}
-        for item in self.wardrobe:
-            groups.setdefault(item["category"], []).append(item)
-        return groups
+    def _by_cat(self, cat):
+        return [i for i in self.wardrobe if i["category"] == cat]
 
-    def _can_build_outfit(self):
-        groups = self._group_by_category()
-        has_top = bool(groups.get("tops") or groups.get("dresses"))
-        has_bottom = bool(groups.get("bottoms") or groups.get("dresses"))
-        return has_top and has_bottom
-
-    # ── Color scoring ────────────────────────────────────────────────────────
-    def _color_score(self, items):
-        colors = [item["color"] for item in items]
-        neutral_colors = [c for c in colors if c in NEUTRALS]
-        accent_colors = [c for c in colors if c not in NEUTRALS]
-
-        # All neutrals — always works
-        if len(accent_colors) == 0:
-            return 85, "Neutral Base", colors
-
-        # One accent on neutral base
-        if len(accent_colors) == 1 and len(neutral_colors) >= 1:
-            return 92, "Neutral + Pop", colors
-
-        # Check wheel relationships for accent colors
-        if len(accent_colors) >= 2:
-            hues = []
-            for c in accent_colors:
-                for name, hue in COLOR_WHEEL.items():
-                    if name.lower() in c.lower() or c.lower() in name.lower():
-                        hues.append(hue)
-                        break
-
-            if len(hues) >= 2:
-                diff = abs(hues[0] - hues[1])
-                diff = min(diff, 12 - diff)  # wrap around
-
-                if diff == 0:
-                    return 88, "Monochromatic", colors
-                elif diff <= 2:
-                    return 82, "Analogous", colors
-                elif diff == 6:
-                    return 78, "Complementary", colors
-                elif diff == 4:
-                    return 74, "Triadic", colors
-                else:
-                    return 55, "Mixed — consider simplifying", colors
-
-        return 65, "Coordinated", colors
-
-    # ── Occasion scoring ─────────────────────────────────────────────────────
-    def _occasion_score(self, items):
-        min_f, max_f = OCCASION_FORMALITY.get(self.occasion, (1, 5))
-        scores = []
-        for item in items:
-            f = item.get("formality", 2)
-            if min_f <= f <= max_f:
-                scores.append(100)
-            elif f < min_f:
-                scores.append(max(0, 100 - (min_f - f) * 25))
-            else:
-                scores.append(max(0, 100 - (f - max_f) * 25))
-
-        # Also check occasion tags
-        occasion_match = sum(
-            1 for item in items
-            if self.occasion in item.get("occasions", [])
-        )
-        tag_bonus = (occasion_match / len(items)) * 20 if items else 0
-
-        base = sum(scores) / len(scores) if scores else 50
-        return min(100, int(base + tag_bonus)), f"Suitable for {self.occasion}"
-
-    # ── Build outfit candidates ──────────────────────────────────────────────
-    def _build_candidates(self):
-        groups = self._group_by_category()
-        candidates = []
-
-        tops     = groups.get("tops", [])
-        bottoms  = groups.get("bottoms", [])
-        dresses  = groups.get("dresses", [])
-        outerwear= groups.get("outerwear", [])
-        footwear = groups.get("footwear", [])
-        accessories = groups.get("accessories", [])
-
-        def make_combo(base_items):
-            combo = list(base_items)
-            if footwear:
-                combo.append(random.choice(footwear))
-            if outerwear and random.random() > 0.5:
-                combo.append(random.choice(outerwear))
-            if accessories and random.random() > 0.6:
-                combo.append(random.choice(accessories))
-            return combo
-
-        # Top + bottom combos
-        for top in tops:
-            for bottom in bottoms:
-                candidates.append(make_combo([top, bottom]))
-
-        # Dress combos
-        for dress in dresses:
-            candidates.append(make_combo([dress]))
-
-        # Shuffle and limit to 30 candidates for performance
-        random.shuffle(candidates)
-        return candidates[:30]
-
-    # ── Score a single outfit ────────────────────────────────────────────────
     def _score_outfit(self, items):
-        color_score, color_rule, palette = self._color_score(items)
-        occ_score, occ_label = self._occasion_score(items)
-
-        # Variety bonus: penalize outfits with only 1-2 items
-        variety = min(100, len(items) * 25)
-
-        # Weighted total
-        total = int(color_score * 0.40 + occ_score * 0.40 + variety * 0.20)
-
+        colors    = [i["color"] for i in items]
+        c_score   = color_harmony_score(colors)
+        o_score   = occasion_score(items, self.occasion)
+        f_score   = formality_score(items, self.occasion)
+        v_score   = variety_bonus(items)
+        total     = c_score + o_score + f_score + v_score
         return {
-            "items": items,
-            "score": total,
+            "score":      min(100, total),
             "score_breakdown": {
-                "Color Harmony": color_score,
-                "Occasion Fit": occ_score,
-                "Variety": variety,
+                "Color harmony":    c_score,
+                "Occasion fit":     o_score,
+                "Formality match":  f_score,
+                "Style variety":    v_score,
             },
-            "color_rule": color_rule,
-            "color_palette": list(set(i["color"] for i in items)),
-            "occasion_fit": occ_label,
-            "ai_explanation": None,
+            "color_palette": colors,
+            "color_rule":   get_color_rule(c_score),
         }
 
-    # ── Generate top N outfits ───────────────────────────────────────────────
     def generate(self, n=3):
-        if not self._can_build_outfit():
+        """Generate top-N outfit combinations."""
+        tops      = self._by_cat("tops")
+        bottoms   = self._by_cat("bottoms")
+        dresses   = self._by_cat("dresses")
+        outerwear = self._by_cat("outerwear")
+        footwear  = self._by_cat("footwear")
+        acc       = self._by_cat("accessories")
+
+        combos = []
+
+        # Dresses (no top/bottom needed)
+        for d in dresses:
+            items = [d]
+            if footwear: items.append(footwear[0])
+            scored = self._score_outfit(items)
+            scored["items"] = items
+            combos.append(scored)
+
+        # Tops + Bottoms
+        for top, bot in itertools.product(tops, bottoms):
+            # Skip same-item duplicates
+            if top["id"] == bot["id"]:
+                continue
+            items = [top, bot]
+            # Add outerwear for formal/work occasions
+            if self.occasion in ("work","formal","date") and outerwear:
+                best_outer = max(outerwear,
+                                 key=lambda o: occasion_score([o], self.occasion))
+                items.append(best_outer)
+            if footwear:
+                best_shoe = max(footwear,
+                                key=lambda f: occasion_score([f], self.occasion))
+                items.append(best_shoe)
+            scored = self._score_outfit(items)
+            scored["items"] = items
+            combos.append(scored)
+
+        if not combos:
             return []
 
-        candidates = self._build_candidates()
-        scored = [self._score_outfit(c) for c in candidates]
-        scored.sort(key=lambda x: -x["score"])
-
-        # De-duplicate: avoid showing very similar outfits
-        seen_tops = set()
-        unique = []
-        for outfit in scored:
-            top_ids = frozenset(i["id"] for i in outfit["items"])
-            if top_ids not in seen_tops:
-                seen_tops.add(top_ids)
-                unique.append(outfit)
+        # Sort by score, deduplicate by top+bottom pair
+        combos.sort(key=lambda x: x["score"], reverse=True)
+        seen, unique = set(), []
+        for c in combos:
+            key = tuple(sorted(i["id"] for i in c["items"]
+                               if i["category"] in ("tops","bottoms","dresses")))
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
             if len(unique) >= n:
                 break
 
-        # Get AI explanation for best outfit if API key available
-        if self.api_key and unique:
-            unique[0]["ai_explanation"] = self.explain_outfit(unique[0])
+        # Add AI explanation to top outfit automatically
+        if unique and self.api_key:
+            try:
+                unique[0]["ai_explanation"] = self.explain_outfit(unique[0])
+            except Exception:
+                pass
 
         return unique
 
-    # ── Claude explanation ───────────────────────────────────────────────────
     def explain_outfit(self, outfit):
-        if not self.api_key or not ANTHROPIC_AVAILABLE:
-            return self._mock_explanation(outfit)
-
-        items_desc = ", ".join(
-            f"{item['color']} {item['name']}" for item in outfit["items"]
-        )
-        color_rule = outfit.get("color_rule", "coordinated")
-        score = outfit.get("score", 0)
-
-        prompt = f"""You are a professional fashion stylist. Explain why this outfit works in 2–3 sentences.
-Be specific about the color theory, the occasion suitability, and one practical styling tip.
-Keep it warm, encouraging, and under 80 words.
-
-Outfit: {items_desc}
-Color rule applied: {color_rule}
-Occasion: {self.occasion}
-City: {self.city}
-Style score: {score}/100
-
-Give ONLY the explanation, no preamble."""
-
+        """Ask Claude to explain why this outfit works."""
         try:
+            import anthropic
             client = anthropic.Anthropic(api_key=self.api_key)
-            message = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
+            items_desc = ", ".join(
+                f"{i['color']} {i['name']}" for i in outfit["items"])
+            prompt = (
+                f"You are a professional fashion stylist. Explain in 2-3 sentences "
+                f"why this outfit works for a {self.occasion} occasion in {self.city}: "
+                f"{items_desc}. Color rule: {outfit.get('color_rule','—')}. "
+                f"Be specific, warm, and practical. No bullet points."
             )
-            return message.content[0].text
-        except Exception as e:
-            return self._mock_explanation(outfit)
+            msg = client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=200,
+                messages=[{"role":"user","content":prompt}]
+            )
+            return msg.content[0].text
+        except Exception:
+            return ""
 
-    def _mock_explanation(self, outfit):
-        items_desc = ", ".join(f"{i['color']} {i['name']}" for i in outfit["items"])
-        rule = outfit.get("color_rule", "coordinated palette")
-        templates = [
-            f"This {rule.lower()} combination works beautifully — the {items_desc} create a balanced, put-together look that's perfect for {self.occasion}. The colors complement each other naturally without competing for attention.",
-            f"A strong {rule.lower()} choice. The {items_desc} flow together with confidence and intention. This is exactly the kind of outfit that looks effortless but is actually well-considered.",
-            f"The {rule.lower()} approach here is spot-on for {self.occasion}. Your {items_desc} hit the right balance of style and practicality — you'll feel comfortable and look sharp all day.",
-        ]
-        return random.choice(templates)
-
-    # ── Style profile analysis ───────────────────────────────────────────────
     def analyze_style_profile(self):
+        """Analyze wardrobe and return style archetype."""
         if not self.wardrobe:
-            return {"archetype": "Unknown", "emoji": "❓", "description": "Add items to discover your style.", "dominant_colors": [], "gaps": []}
+            return {"archetype":"Unknown","description":"Add items to get your profile",
+                    "emoji":"👗","dominant_colors":[],"gaps":[]}
 
-        # Count style tags
-        all_tags = []
+        # Count styles
+        style_counts = {}
         for item in self.wardrobe:
-            all_tags.extend(item.get("styles", []))
-        tag_counts = Counter(all_tags)
+            for s in item.get("styles",[]):
+                style_counts[s] = style_counts.get(s,0) + 1
 
-        # Find best matching archetype
-        best_archetype = ARCHETYPES[1]  # default: casual cool
-        best_score = 0
-        for arch in ARCHETYPES:
-            score = sum(tag_counts.get(tag, 0) for tag in arch["tags"])
-            if score > best_score:
-                best_score = score
-                best_archetype = arch
+        # Count colors
+        color_counts = {}
+        for item in self.wardrobe:
+            c = item.get("color","")
+            color_counts[c] = color_counts.get(c,0) + 1
+        dominant = sorted(color_counts.items(), key=lambda x:-x[1])
 
-        # Dominant colors
-        color_counts = Counter(item["color"] for item in self.wardrobe)
-        dominant_colors = color_counts.most_common(8)
+        # Dominant style
+        top_style = max(style_counts, key=style_counts.get) if style_counts else "casual"
 
-        # Wardrobe gaps
+        ARCHETYPES = {
+            "formal":   ("The Professional", "Sharp, polished, boardroom-ready.", "💼"),
+            "casual":   ("The Everyday Chic","Relaxed but always put-together.","👕"),
+            "minimal":  ("The Minimalist",   "Clean lines, neutral palette, timeless.","🖤"),
+            "streetwear":("The Streetwear Icon","Bold, urban, always on-trend.","🧢"),
+            "elegant":  ("The Elegant One",  "Refined taste, classic silhouettes.","✨"),
+            "smart":    ("The Smart Casual Expert","The perfect work-to-weekend wardrobe.","👔"),
+            "sporty":   ("The Athleisure Pro","Comfort meets style effortlessly.","👟"),
+            "versatile":("The Chameleon",    "Adaptable style for any occasion.","🌟"),
+        }
+        arch = ARCHETYPES.get(top_style, ARCHETYPES["casual"])
+
+        # Find wardrobe gaps
+        cats = {i["category"] for i in self.wardrobe}
         gaps = []
-        groups = self._group_by_category()
-        if "footwear" not in groups:
-            gaps.append("👟 No footwear added — shoes complete every outfit")
-        if "outerwear" not in groups:
-            gaps.append("🧥 No outerwear — consider adding a jacket or coat")
-        if len(groups.get("tops", [])) < 3:
-            gaps.append("👕 More tops would give you more outfit combinations")
-        if len(groups.get("bottoms", [])) < 2:
-            gaps.append("👖 More bottoms would double your outfit options")
-        if not groups.get("accessories"):
-            gaps.append("👜 Accessories can elevate any outfit significantly")
+        if "tops"      not in cats: gaps.append("Add some tops")
+        if "bottoms"   not in cats and "dresses" not in cats:
+            gaps.append("Add bottoms or dresses")
+        if "outerwear" not in cats: gaps.append("A jacket or coat would complete your look")
+        if "footwear"  not in cats: gaps.append("Add shoes for complete outfits")
+        if len(self.wardrobe) < 5:  gaps.append("Add more variety for better outfit combinations")
+        n_neutrals = sum(1 for i in self.wardrobe if _is_neutral(i.get("color","")))
+        if n_neutrals < 2:          gaps.append("Add neutral basics (white, black, gray)")
 
         return {
-            "archetype": best_archetype["name"],
-            "emoji": best_archetype["emoji"],
-            "description": best_archetype["description"],
-            "dominant_colors": dominant_colors,
-            "gaps": gaps,
+            "archetype":       arch[0],
+            "description":     arch[1],
+            "emoji":           arch[2],
+            "dominant_colors": dominant[:6],
+            "gaps":            gaps,
         }
